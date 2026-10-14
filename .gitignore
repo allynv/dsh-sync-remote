@@ -1,0 +1,9 @@
+node_modules/
+.npm-cache/
+.pnpm-store/
+.selfcheck/
+*.log
+
+# Build output: `npm run build` produces these from src/app.ts and src/client.ts.
+# They are not tracked, so a fresh clone needs one build before dsh starts.
+lib/

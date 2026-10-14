@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "远程访问（隧道 + Passkey）",
+    "description": "通过 SSH 反向隧道 + WebAuthn Passkey 网关对外发布 Web GUI，DSH 本体仍只监听回环地址。"
+  }
+}

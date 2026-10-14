@@ -1,0 +1,12 @@
+# Development overlay: mounts the plugin straight from this checkout with
+# `dsh --profile web --patch ./cordis.yml`.
+#
+# Installed use does not need this file — `cordis.patch.yml` is the bundle's own
+# layer and its row resolves by package name. Both insert the same row id, so
+# applying this overlay on top of an installed bundle repoints that row at the
+# checkout; that is the intended way to iterate on this plugin.
+
+- insert:
+    - id: dsh-sync-remote
+      name: './src/index.ts'
+      config: {}

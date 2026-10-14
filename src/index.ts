@@ -1,0 +1,397 @@
+/**
+ * `dsh-sync-remote` — publish this DSH Web GUI without opening its port, and
+ * without trusting the network in front of it.
+ *
+ * Three pieces, one process:
+ *
+ * 1. A **reverse SSH tunnel** asks the VPS to listen on a loopback port and
+ *    hand the accepted connections here, so the VPS runs nothing but its own
+ *    `sshd` and the public port never exists on this machine.
+ * 2. A **passkey gateway** answers on a loopback port: unauthenticated browsers
+ *    get a WebAuthn login page, and nothing unauthenticated is ever forwarded.
+ * 3. A **reverse proxy** relays the authenticated request to the local DSH Web
+ *    server with `Host`, `Origin`, and the Fetch-Metadata headers untouched, so
+ *    the GUI's own trust fence and signed session cookie keep working.
+ *
+ * The plugin needs no Host service to serve. The one it optionally uses is
+ * `connection`, and only for two things: putting the settings page's routes
+ * behind DSH's own browser-trust fence and operator session, and building the
+ * tokenized entry URL that signs a browser into the GUI after this gate has
+ * admitted it.
+ *
+ * Enrollment is one-time by design: a link is minted on demand (by the settings
+ * page, or once at startup when no passkey exists yet), dies with the process or
+ * with its first successful use, and is never written into any durable setting.
+ *
+ * A configuration this plugin refuses no longer unloads its row. That is
+ * deliberate: the settings page is how the value gets fixed, and a failed row
+ * disappears from the settings service along with the only surface that could
+ * repair it. The refusal is logged, reported to the page, and the gateway stays
+ * down until the value is valid.
+ *
+ * @module @allynv/dsh-sync-remote
+ */
+
+import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { describeConfig, plainRow, provenance, resolveConfig, type Provenance, type ResolvedConfig, type ResolvedTarget, type RowConfig } from './config.ts'
+import { Gateway } from './gateway.ts'
+import { registerRoutes, type RouteRegistry, type RouteSource } from './routes.ts'
+import { StateStore } from './state.ts'
+import { buildStatus, sshEquivalent } from './status.ts'
+import { TunnelManager } from './tunnel.ts'
+import { PasskeyService } from './webauthn.ts'
+import type { Logger, StateDocument } from './types.ts'
+
+/** Stable Cordis plugin name. */
+export const name = 'dsh-sync-remote'
+
+// The row's schema, re-exported so the Host validates and the settings UI
+// renders the same declaration this module resolves.
+export { Config } from './config.ts'
+
+/** File beside the state file holding the current one-time enrollment URL. */
+const ENROLL_FILE = 'enroll-url.txt'
+
+/**
+ * The console channel this plugin reports on, and the line between what an
+ * operator must see there and what only the settings page needs.
+ *
+ * Deliberately not `ctx.logger`: in the `dsh web` profile that logger's output
+ * does not reach the console an operator is looking at (only `console.log`
+ * lines such as `dsh web:` appear), and the messages this plugin must be able
+ * to tell a human — the one-time enrollment link, a refused configuration — are
+ * exactly the ones that would be lost. Writing to the console directly, the
+ * same way the Web app prints its URL, is what makes them reachable.
+ *
+ * That console is a startup surface, not a log file. A healthy start prints
+ * exactly one line of this plugin's own ({@link localEntryLine}); every other
+ * line that reaches it is something a human has to act on: a refusal, a tunnel
+ * that cannot come up, a device waiting to be enrolled. Routine detail — the
+ * resolved settings, the state file, the ports, a working session's tunnel and
+ * sign-in events — is `info`, and `info` is silent here on purpose: the
+ * settings page ("远程访问 / Remote access") reports the same facts to whoever
+ * goes looking because something *is* wrong.
+ * @returns the log levels used throughout this bundle.
+ */
+function loggerFor(): Logger {
+  return {
+    info: () => {},
+    warn: (message: string) => { console.warn(message) },
+    error: (message: string) => { console.error(message) },
+  }
+}
+
+/**
+ * The one line a healthy start adds to the console: the local DSH Web URL,
+ * carrying this process's launch token.
+ *
+ * `dsh web --public-url …` prints the *public* address, and that address is
+ * useless to an operator sitting at this machine. The token is read from the
+ * Host at the moment this line is printed rather than copied once at startup,
+ * so a reload that hands the connection service a new token re-prints the
+ * current one instead of a stale string. The line is exactly as sensitive as
+ * the `dsh web: …?token=…` line beside it: it is the same process credential.
+ * @param connection - the Host connection service that owns the launch token.
+ * @param target - the local DSH Web server the gateway proxies to.
+ * @returns the console line.
+ */
+function localEntryLine(connection: ConnectionContext['connection'], target: ResolvedTarget): string {
+  return `dsh-sync-remote: ${connection.authenticatedUrl(`http://${target.host}:${String(target.port)}/`)}`
+}
+
+/** @returns one failure's message, whatever was thrown. */
+function reason(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Run one callback after every Host row has mounted, or at once when the Host
+ * cannot say.
+ *
+ * The fence probe asks the GUI a question whose answer *changes* while the tree
+ * is still mounting: `/api` answers 404 before its route owner exists and 401
+ * once it does, so a probe that wins that race reports a fault the deployment
+ * does not have. The wait is registered, never awaited by this row — the row is
+ * part of the tree that has to settle, and awaiting it from inside `apply` would
+ * deadlock the boot. A hand-built context with no Loader is already the complete
+ * tree.
+ * @param ctx - Host plugin context.
+ * @param body - what to run once asking makes sense.
+ */
+function onceLoaded(ctx: PluginContext, body: () => void): void {
+  const loader = ctx.get?.('loader') as { await?: () => Promise<unknown> } | undefined
+  const wait = loader?.await
+  if (wait === undefined) {
+    body()
+    return
+  }
+  // A failed boot is the Host's diagnostic to print; this callback only wanted
+  // to know *when* to ask, so both arms run the body.
+  void wait.call(loader).then(body, body)
+}
+
+/**
+ * The slice of the Cordis plugin context this bundle uses.
+ *
+ * Declared structurally rather than imported from `@deepseek-ai/cordis`: this
+ * bundle ships no dependency on the Harness packages. `effect` is the only
+ * capability serving needs; `inject` is optional and only mounts the settings
+ * routes (and the GUI sign-in redirect) in a profile that has `connection`.
+ */
+export interface PluginContext {
+  effect(body: () => () => void | Promise<void>, label?: string): void
+  /** Run a callback once the named services exist; absent in a bare context. */
+  inject?(names: string[], callback: (ctx: ConnectionContext) => void): unknown
+  /**
+   * Resolve another Host service by name. Present on the real Host context and
+   * absent in a hand-built one; only `loader` is ever read here, and only to
+   * learn when boot has finished.
+   */
+  get?(name: string): unknown
+}
+
+/** The Host services the settings routes and the sign-in redirect use. */
+export interface ConnectionContext {
+  connection: {
+    readonly fetch: RouteRegistry
+    /** Add DSH's own launch token to an application URL. */
+    authenticatedUrl(baseUrl: string): string
+  }
+}
+
+/**
+ * Mount the tunnel, the passkey gateway, the reverse proxy, and the settings
+ * routes.
+ * @param ctx - Host plugin context.
+ * @param config - the plugin row's config as the settings page wrote it.
+ */
+export async function apply(ctx: PluginContext, config?: RowConfig): Promise<void> {
+  const log = loggerFor()
+  const row = plainRow(config ?? {})
+  /** Which layer supplied each field; filled as far as resolution gets. */
+  const sources: Provenance = {}
+  let resolved: ResolvedConfig | null = null
+  let statusError: string | null = null
+  try {
+    resolved = resolveConfig(row, sources)
+  } catch (error) {
+    statusError = reason(error)
+  }
+
+  // Absent configuration means "not enabled on this machine", not "broken": a
+  // deployment that installs the bundle but has not named its public origin yet
+  // should get one explanatory line, not a failed row in the profile. It is a
+  // `warn` rather than an `info` for the same reason — the console carries what
+  // a human has to act on, and this row is waiting on exactly that.
+  const configured = provenance(row).publicOrigin !== 'unset'
+  if (!configured) {
+    log.warn('dsh-sync-remote: no public origin configured yet; set it in Settings → Remote access; public access stays off')
+  } else if (statusError !== null) {
+    log.error(`dsh-sync-remote: refusing to serve until the configuration is fixed: ${statusError}`)
+  } else if (resolved !== null) {
+    log.info(`dsh-sync-remote: ${JSON.stringify(describeConfig(resolved))}`)
+  }
+
+  let store: StateStore | null = null
+  let state: StateDocument | null = null
+  let passkeys: PasskeyService | null = null
+  let gateway: Gateway | null = null
+  let tunnel: TunnelManager | null = null
+  let fence: { authority: string; status: number } | null = null
+  /** Builds DSH's tokenized entry URL once the `connection` service is mounted. */
+  let dshEntryFor: ((path: string) => string) | null = null
+  const enrollFile = resolved === null ? null : join(dirname(resolved.stateFile), ENROLL_FILE)
+
+  /**
+   * Keep `enroll-url.txt` in step with the pending link, and announce it. The
+   * file exists only while a link does: a stale file would advertise a token
+   * that no longer works.
+   * @param url - the pending link, or null when none is.
+   */
+  const onEnrollmentChange = async (url: string | null): Promise<void> => {
+    if (enrollFile === null) return
+    if (url === null) {
+      await rm(enrollFile, { force: true })
+      return
+    }
+    await mkdir(dirname(enrollFile), { recursive: true, mode: 0o700 })
+    // `mode` only applies when the file is created, so an older 0644 copy would
+    // stay world-readable while the docstring promises a private credential.
+    // Removing first makes the mode real on every write.
+    await rm(enrollFile, { force: true })
+    await writeFile(enrollFile, `${url}\n`, { encoding: 'utf8', mode: 0o600 })
+    log.warn('dsh-sync-remote: a one-time enrollment link is ready; it works for one registration, within ten minutes:')
+    log.warn(`dsh-sync-remote:   ${url}`)
+    log.warn(`dsh-sync-remote: it is also in ${enrollFile}, and that file disappears once the link is used, expires, or the process restarts`)
+  }
+
+  if (resolved !== null && statusError === null) {
+    store = new StateStore(resolved.stateFile)
+    state = await store.load()
+    log.info(`dsh-sync-remote: state file ${resolved.stateFile} holds ${String(state.passkeys.length)} passkey(s)`)
+
+    passkeys = new PasskeyService({
+      rpID: resolved.rpID,
+      rpName: resolved.rpName,
+      origin: resolved.publicOrigin,
+      state,
+      store,
+      log,
+    })
+
+    gateway = new Gateway({
+      config: resolved,
+      passkeys,
+      store,
+      log,
+      // Late-bound: the `connection` service arrives in its own microtask, and a
+      // browser can only reach this gateway once the listener is up anyway.
+      dshEntry: (path) => dshEntryFor === null ? null : dshEntryFor(path),
+      onEnrollmentChange,
+    })
+    // Own the listener from the moment it exists: `listen()` can fail, and
+    // `tunnel.start()` can fail after it succeeded. Registering the disposer
+    // here means neither failure can leave a socket bound to a dead row, and a
+    // pending link never outlives the process that minted it.
+    ctx.effect(() => () => {
+      return Promise.all([tunnel?.stop(), gateway?.close(), onEnrollmentChange(null)]).then(() => undefined)
+    }, 'dsh-sync-remote: gateway, tunnel, and the one-time link')
+
+    try {
+      await gateway.listen()
+    } catch (error) {
+      statusError = reason(error)
+      log.error(`dsh-sync-remote: the gateway did not start: ${statusError}`)
+      await gateway.close()
+      gateway = null
+    }
+  }
+
+  if (resolved !== null && gateway !== null && statusError === null) {
+    tunnel = new TunnelManager({
+      config: resolved,
+      local: { host: resolved.loopbackHost, port: resolved.serverPort },
+      store: store as StateStore,
+      log,
+    })
+    gateway.tunnel = tunnel
+    try {
+      await tunnel.start()
+    } catch (error) {
+      // A refused tunnel is a status, not a reason to drop the gateway: the
+      // gateway is still reachable on loopback and the settings page explains it.
+      statusError = reason(error)
+      log.error(`dsh-sync-remote: the reverse tunnel did not start: ${statusError}`)
+    }
+
+    // A wrong `--trusted-host` is the one misconfiguration that produces a live,
+    // authenticated, and completely unusable deployment. Ask the GUI directly —
+    // but only once boot has finished, because `/api` answers 404 until its
+    // route owner mounts and that answer describes the moment, not the
+    // deployment (see `onceLoaded`). The listener and the tunnel above are
+    // already serving by then; only this question waits.
+    const settings = resolved
+    const probing = gateway
+    onceLoaded(ctx, () => {
+      void probing.preflight().then((probe) => {
+        fence = { authority: probe.authority, status: probe.status }
+        if (probe.status === 0) {
+          log.warn(`dsh-sync-remote: the local DSH Web server at http://${settings.target.host}:${String(settings.target.port)} did not answer (${probe.error ?? 'no response'}); start it with dsh web`)
+        } else if (probe.status === 403) {
+          log.error(`dsh-sync-remote: the DSH browser-trust fence refused Host ${JSON.stringify(probe.authority)}; start the GUI with --trusted-host ${JSON.stringify(probe.authority)} (and --public-url ${settings.publicOrigin}/), or every request through this gateway will 403`)
+        } else if (probe.status === 401) {
+          log.info(`dsh-sync-remote: the local GUI accepts Host ${JSON.stringify(probe.authority)}; the missing piece is only its own launch-token sign-in`)
+        } else {
+          log.warn(`dsh-sync-remote: the local GUI answered HTTP ${String(probe.status)} for Host ${JSON.stringify(probe.authority)}; expected 401 from an unauthenticated /api request`)
+        }
+      }, () => {
+        // The probe resolves on every outcome it classifies; a stray rejection
+        // here must not become an unhandled one.
+      })
+    })
+
+    if (passkeys !== null && passkeys.enrolled) {
+      log.info(`dsh-sync-remote: ${String(state?.passkeys.length ?? 0)} passkey(s) registered; sign in at ${resolved.publicOrigin}/signin`)
+      log.info('dsh-sync-remote: to add another device, mint a one-time link in Settings → Remote access')
+    } else {
+      // The bootstrap case: nobody can get in yet, so hand the operator a link
+      // without making them open the settings page first.
+      log.warn('dsh-sync-remote: no passkey is registered yet; minting one one-time enrollment link:')
+      await gateway.mintEnrollment()
+    }
+    if (!resolved.tunnel.enabled) {
+      // A deliberate setting, not a fault: the settings page shows the tunnel's
+      // state, and an operator who turned it off does not need to be told on
+      // every start.
+      log.info(`dsh-sync-remote: the reverse tunnel is off; the gateway is reachable on http://${resolved.bindHost}:${String(resolved.serverPort)} only`)
+    } else {
+      // Detail, like the ports: the settings page shows the same command line,
+      // and that is where an operator debugging a refused tunnel reads it.
+      log.info(`dsh-sync-remote: the tunnel is equivalent to: ${sshEquivalent(resolved) ?? '(not configured)'}`)
+    }
+  }
+
+  // The settings page's own data. Registered whenever the Host has a connection
+  // service, including while the gateway is down: that page is what reports
+  // *why* it is down, so it must not depend on the gateway existing.
+  if (ctx.inject !== undefined) {
+    const source: RouteSource = {
+      status: () => {
+        const now = gateway
+        return buildStatus({
+          configured,
+          resolved,
+          sources,
+          // Only a configuration that was *attempted* can be refused; a row with
+          // no origin yet is a state the page guides the operator out of.
+          configError: configured ? statusError : null,
+          enrolled: (state?.passkeys.length ?? 0) > 0,
+          enrollmentPending: now !== null && now.hasPendingEnrollment(),
+          enrollmentExpiresAt: now === null ? null : now.enrollmentExpiresAt(),
+          hostKey: state?.sshHostKey ?? null,
+          passkeys: passkeys === null ? [] : passkeys.list(),
+          gatewayListening: now !== null,
+          tunnel: tunnel === null ? null : tunnel.snapshot(),
+          fence,
+        })
+      },
+      mintEnrollment: async () => {
+        if (gateway === null) return { ok: false, reason: 'the gateway is not running; fix the configuration first' }
+        const minted = await gateway.mintEnrollment()
+        return { url: minted.url, expiresAt: minted.expiresAt }
+      },
+      removePasskey: async (id) => {
+        if (passkeys === null) return { ok: false, reason: 'no gateway is running yet' }
+        if (state !== null && state.passkeys.length <= 1) {
+          return { ok: false, reason: 'the last passkey cannot be removed; keep one device able to sign in' }
+        }
+        const removed = await passkeys.remove(id)
+        return removed ? { ok: true } : { ok: false, reason: 'no such passkey' }
+      },
+      forgetHostKey: async () => {
+        if (store === null || state === null) return { ok: false, reason: 'no gateway is running yet' }
+        if (state.sshHostKey === null) return { ok: false, reason: 'no host key is pinned yet' }
+        state.sshHostKey = null
+        await store.persist()
+        if (tunnel !== null) {
+          // Reconnect so the next connection pins whatever the VPS presents now.
+          await tunnel.stop()
+          await tunnel.start()
+        }
+        return { ok: true }
+      },
+    }
+    ctx.inject(['connection'], (connectionCtx) => {
+      registerRoutes(connectionCtx.connection.fetch, source, log)
+      if (resolved !== null) {
+        const origin = resolved.publicOrigin
+        dshEntryFor = (path) => connectionCtx.connection.authenticatedUrl(`${origin}${path}`)
+        // The single line a healthy start adds. Printed here rather than in the
+        // body above because the launch token lives on the connection service,
+        // and built at print time so it is the token this process is using now.
+        console.log(localEntryLine(connectionCtx.connection, resolved.target))
+      }
+    })
+  }
+}

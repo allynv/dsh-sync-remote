@@ -1,0 +1,49 @@
+# dsh-sync-remote — the profile layer for this bundle.
+#
+# It inserts one row with an empty config, and that is deliberate: this plugin
+# reads NO environment variables at all. Every setting lives in the config below
+# the row (or in the profile patch that overrides it), which is what makes a
+# deployment reproducible and keeps secrets out of the environment.
+#
+# The settings, all of them required (see README §3 — a field with a box in the
+# settings form has no default in code):
+#
+#   publicOrigin            public origin browsers use, e.g. https://dsh.example.com
+#   serverPort              VPS-side port: sshd listens on 127.0.0.1:<it>, Nginx proxies to it,
+#                           and this gateway binds it too (so ssh -R has the same port twice)
+#   clientPort              local port of `dsh web` this gateway proxies to
+#   sessionTtlHours         how long a signed-in session cookie stays valid
+#   tunnel.enabled          whether to open the reverse tunnel (defaults to on when the
+#                           three coordinates below are all set)
+#   tunnel.host             VPS hostname or IP to SSH into
+#   tunnel.port             VPS SSH port (usually 22 — not serverPort)
+#   tunnel.user             SSH user on the VPS
+#   tunnel.privateKeyFile   absolute path of the private key (OpenSSH/PKCS#1/SEC1, not PKCS#8)
+#   tunnel.passphrase       passphrase for that key, only when the key has one
+#
+# Derived, never configurable: the loopback bind address, the WebAuthn RP ID (it
+# must be the origin's hostname), the authenticator display name, the pinned host
+# key (Trust On First Use, forgettable from the settings page), and the state file
+# path. See README §3 for why each one has no field.
+#
+# Example row:
+#
+#   - insert:
+#       - id: dsh-sync-remote
+#         name: '@allynv/dsh-sync-remote'
+#         config:
+#           publicOrigin: https://dsh.example.com
+#           serverPort: 3090
+#           clientPort: 3080
+#           sessionTtlHours: 720
+#           tunnel:
+#             enabled: true
+#             host: 203.0.113.10
+#             port: 22
+#             user: root
+#             privateKeyFile: /home/me/.ssh/id_ed25519
+
+- insert:
+    - id: dsh-sync-remote
+      name: '@allynv/dsh-sync-remote'
+      config: {}

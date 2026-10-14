@@ -1,0 +1,66 @@
+{
+  "name": "@allynv/dsh-sync-remote",
+  "version": "1.0.0",
+  "description": "Reverse SSH tunnel plus a passkey-gated public entry in front of this DSH Web GUI.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/allynv/dsh-sync-remote.git"
+  },
+  "bugs": {
+    "url": "https://github.com/allynv/dsh-sync-remote/issues"
+  },
+  "homepage": "https://github.com/allynv/dsh-sync-remote#readme",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "src",
+    "lib",
+    "locale",
+    "cordis.patch.yml",
+    "cordis.yml",
+    "icon.svg",
+    "LICENSE",
+    "README.md",
+    "tsconfig.json",
+    "tsconfig.client.json",
+    "tsconfig.build.json"
+  ],
+  "icon": "icon.svg",
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "build:watch": "tsc -p tsconfig.build.json --watch",
+    "check": "tsc --noEmit && tsc -p tsconfig.client.json --noEmit",
+    "test": "npm run build && node test/selfcheck.mts && node test/client.spec.mts",
+    "accept": "node test/acceptance.mts"
+  },
+  "dependencies": {
+    "@deepseek-ai/cosmokit": "^1.8.6-alpha.1",
+    "@deepseek-ai/schemastery": "^3.18.5-alpha.1",
+    "@simplewebauthn/server": "^14.0.3",
+    "qrcode-generator": "^2.0.4",
+    "ssh2": "^1.17.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/ssh2": "^1.15.6",
+    "typescript": "^7.0.2"
+  }
+}

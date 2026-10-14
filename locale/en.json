@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Remote Access (Tunnel + Passkey)",
+    "description": "Publishes this Web GUI through an SSH reverse tunnel and a WebAuthn passkey gateway, leaving the GUI bound to loopback."
+  }
+}

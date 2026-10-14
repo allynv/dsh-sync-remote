@@ -1,0 +1,4 @@
+# Normalize every text file to LF in the repository, whatever the platform
+# checks it out on. Without this, Git warns on every file on Windows, and a
+# CRLF checkout would make local output differ from what the repository holds.
+* text=auto eol=lf
