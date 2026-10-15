@@ -1737,6 +1737,20 @@ await check('the login page and its script are served with a policy', async () =
   const script = await request(port, { path: '/app.js', headers: { host: publicHost } })
   assert.equal(script.status, 200)
   assert.match(script.body, /navigator\.credentials/)
+  // The page is open to the whole internet, so it must not carry the enrollment
+  // entrance: not the link shape, not the path, and not where a link comes from. The
+  // token was never in it — this asserts the path and the instructions are not either,
+  // because "where to get the credential" on an anonymous page is the first half of
+  // publishing it.
+  for (const [what, text] of [['the document', page.body], ['the script', script.body]] as const) {
+    assert.equal(text.includes('?token='), false, `${what} must not carry a link shape`)
+    assert.equal(text.includes('/auth?token'), false, `${what} must not name the enrollment path`)
+    assert.equal(text.includes('one-time enrollment link'), false, `${what} must not say where a link comes from`)
+    assert.equal(text.includes('注册链接'), false, `${what} must not mention an enrollment link`)
+    assert.equal(text.includes('生成注册二维码'), false, `${what} must not point at the mint button`)
+  }
+  // And it still says the true, useful thing: this gateway is not open yet.
+  assert.match(script.body, /还没有注册任何设备/u)
   const missing = await request(port, { path: '/nope', headers: { host: publicHost } })
   assert.equal(missing.status, 401, 'an unknown path is the GUI\'s business, not a gateway route')
 })

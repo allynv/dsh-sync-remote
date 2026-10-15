@@ -231,14 +231,17 @@ if (bootstrap && !window.isSecureContext) {
 }
 
 // Nothing registered yet: say so here instead of letting the button fail with a
-// server error. The enrollment token is deliberately NOT in this page — anyone on
-// the internet can open it — so only the path is shown.
+// server error. What this page must NOT do is name the enrollment entrance, its path,
+// or where the link comes from: anyone on the internet can open this page, and the
+// one-time link is a credential for taking the gateway over. The three places that
+// carry it are all operator-side — the `dsh` console line, `enroll-url.txt` (0600),
+// and Settings → Remote access on the machine running DSH — and the README's
+// 「开始使用」 section names them. A stranger learns only that this gateway is not
+// open yet, which is visible from the disabled button anyway.
 const needsEnrollment = bootstrap !== undefined && bootstrap.enrolled !== true && mode !== 'enroll'
 if (needsEnrollment) {
   if (button) button.disabled = true
-  say('这台网关还没有注册任何 Passkey，登录按钮暂时不可用。请先打开注册链接：'
-    + String(bootstrap?.origin ?? '') + '/auth?token=…'
-    + '（token 在 dsh 日志的 “one-time enrollment link” 一行，或在 DSH 的「设置 → 远程访问」里点“生成注册二维码”；链接只能用一次，10 分钟内有效）', 'error')
+  say('这台网关还没有注册任何设备，暂时无法登录。首次注册要在运行 DSH 的那台机器上完成（见 README 的「开始使用」）。', 'error')
 }
 
 /** Run the sign-in ceremony. */

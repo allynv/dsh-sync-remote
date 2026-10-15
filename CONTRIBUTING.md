@@ -462,6 +462,7 @@ sudo nginx -t && sudo systemctl reload nginx
 - `@deepseek-ai/schemastery` 与 `@deepseek-ai/cosmokit` 按**宿主 vendored 的同版本**（`3.18.5-alpha.1` / `1.8.6-alpha.1`）钉住：设置页靠 `schema.toJSON()` 的信封与宿主通信，版本漂移没有意义。它们从 npm 公开包安装，是这份 bundle 唯一两个 `@deepseek-ai/*` 依赖。
 - 设置页**不能**替你改 DSH 自己的两个命令行开关（`--trusted-host` / `--public-url`）：那是 `dsh web` 进程的启动参数，不属于本插件的行。页面只做预检，并据此**决定要不要开隧道**（预检不过就不开，见 §五「启动时的围栏探测」）。
 - 注册链接是**一次性**的：丢掉或过期就要重新生成。没有"固定注册令牌"这个选项——一个长期有效的注册凭据不值得留在磁盘上。
+- **公网登录页不透露注册入口**：`/signin` 与 `/app.js` 里既不出现链接形状（`?token=`）、也不出现注册路径（`/auth?token`）、也不出现"去哪生成"的说明——只说明"这台网关还没有注册任何设备"。在一把设备都没注册时，那条链接就是接管网关的唯一凭据，而登录页任何人都能打开；"去哪拿凭据"正是泄露的第一步。链接只出现在三处 operator 侧：`dsh` 控制台、`enroll-url.txt`（0600）、本机设置页。selfcheck 的「the login page and its script are served with a policy」逐条断言这五个字符串不出现。
 - 升级到带「测试连接」的版本后，已有部署第一次启动是 `untested`（老状态文件没有 `tunnelTests`），需要点一次「测试连接」。这是刻意 **fail closed**：`sshHostKey` 只能证明"以前连过某台机器"，证明不了**当前这组值**对，所以不做祖父豁免。
 - 指纹覆盖 `host, port, user, privateKeyFile, passphrase(加盐哈希), serverPort, clientPort, publicOrigin`——**测试证明过的值全部在内**。代价是改这些值都必须重测一次；这是刻意的：`serverPort` 与 Nginx `proxy_pass` 不一致的那种 502，现在**在保存前就会被第 6 阶段拦住**，而不是等公网打不开才发现。
 - 自动登录重定向会把 DSH 的启动令牌放进一次 303 的 `Location`（随后 DSH 立即换成自己的 Cookie）。它是控制台本来就打印的那个凭据；若你不想让它出现在浏览器历史里，可以关掉这一行为（[src/index.ts](src/index.ts) 里不传 `dshEntry`），代价是新设备注册后要手动打开一次 `dsh web` 打印的 `?token=` 链接。
