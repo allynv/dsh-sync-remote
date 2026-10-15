@@ -1341,6 +1341,9 @@ await check('the settings status payload carries the state, the devices, and no 
     gatewayListening: true,
     tunnel: { state: 'listening', kind: null, attempts: 1, channels: 2, since: 0, everListening: true, nextRetryAt: null, suspected: null, remote: 'vps:22', hostKey: 'SHA256:x', lastError: null },
     fence: { authority: 'dsh.example.test', status: 401 },
+    // The launch facts ride the payload so the page can explain a fence refusal in
+    // Chinese instead of echoing the Host's English console sentence.
+    launch: { trustedHosts: ['dsh.example.test'], publicUrl: 'https://dsh.example.test' },
   })
   assert.equal(payload.configured, true)
   assert.equal(payload.configError, null)
@@ -1384,6 +1387,7 @@ await check('the settings status payload carries the state, the devices, and no 
     gatewayListening: true,
     tunnel: { state: 'reconnecting', kind: 'unreachable', attempts: 9, channels: 0, since: 0, everListening: false, nextRetryAt: 12_345, suspected: 'configuration', remote: 'vps:3090', hostKey: null, lastError: 'connect ECONNREFUSED 1.2.3.4:3090' },
     fence: null,
+    launch: null,
   })
   assert.equal(failingTunnel.runtime.tunnel?.state, 'reconnecting')
   assert.equal(failingTunnel.runtime.tunnel?.remote, 'vps:3090')
@@ -1434,7 +1438,7 @@ await check('the settings routes answer JSON and refuse bad writes', async () =>
     status: () => buildStatus({
       configured: true, resolved: null, sources: {}, configError: 'publicOrigin is not an absolute URL',
       enrolled: false, enrollmentPending: false, enrollmentExpiresAt: null, hostKey: null,
-      passkeys: [], gatewayListening: false, tunnel: null, fence: null,
+      passkeys: [], gatewayListening: false, tunnel: null, fence: null, launch: null,
     }),
     removePasskey: async (id) => {
       if (id === 'missing') return { ok: false, reason: 'no such passkey' }
@@ -2076,7 +2080,7 @@ await check('a refused fence closes the tunnel before it ever opens', async () =
     const statusRoute = routes.find(route => route.path === STATUS_PATH)
     assert.ok(statusRoute !== undefined)
     const payload = await statusRoute.fetch(new Request(`https://dsh.example.test${STATUS_PATH}`)).then(response => response.json()) as {
-      runtime: { gateway: string, tunnel: { state: string, attempts: number, lastError: string | null } | null, fence: { status: number, ok: boolean } | null },
+      runtime: { gateway: string, tunnel: { state: string, attempts: number, lastError: string | null } | null, fence: { status: number, ok: boolean } | null, launch: { trustedHosts: string[] } | null },
       info: { remoteBind: string | null, sshEquivalent: string | null },
     }
     // The gateway stays up: it is what serves this page and the local GUI.

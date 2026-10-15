@@ -180,6 +180,8 @@ interface Status {
       lastError: string | null
     } | null
     fence: { authority: string, status: number, ok: boolean } | null
+    /** What `dsh web` was launched with, when the Host can report it. */
+    launch: { trustedHosts: string[], publicUrl: string | null } | null
   }
 }
 
@@ -304,15 +306,22 @@ window.__ModuleLoader__.load({
       needOrigin: '还没填公网地址。在下面填好「公网地址」并保存，公网入口就会开启（本机 127.0.0.1 的 GUI 不受影响）。',
       gateway: '网关',
       tunnel: '隧道',
-      fence: 'DSH 围栏',
+      fence: '安全围栏',
       off: '未启动',
       listening: '监听中',
       fenceOk: '该 Host 被接受',
-      fenceBad: '该 Host 被拒绝：给 dsh web 加 --trusted-host',
+      fenceBad: '现 Host 被拒绝，DSH 启动时未加 --trusted-host',
+      fenceBadOtherHost: '现 Host 被拒绝：DSH 信任的是别的域名',
       tunnelFailed: '隧道没建立起来：',
       tunnelFailedHint: '上面是 ssh2 报的原始原因（例如 ECONNREFUSED 表示主机/端口不对）。改完保存即可重试。',
       tunnelBlocked: '隧道没有开启：DSH 的信任围栏不接受这个域名。',
       tunnelBlockedHint: '用 dsh --profile web --public-url <公网地址>/ --trusted-host <域名> 重启 DSH 即可。在它接受之前，公网入口不会打开（不是故障，是刻意不开）。',
+      blockedNoFlag: '具体原因：dsh web 启动时**没有**加 --trusted-host，所以它拒绝了 Host "{host}"。',
+      blockedWrongHost: '具体原因：dsh web 信任的是 {trusted}，而这里发布的是 "{host}"——两者不一致，围栏因此拒绝。',
+      blockedDespiteTrust: '具体原因：dsh web 声明信任 "{host}"，但围栏仍然拒绝它——检查拼写、是否多写了端口，或 3080 上跑的是另一个 dsh 进程。',
+      blockedNoAnswer: '具体原因：本机 GUI 没有确认它接受该域名（最近一次答复是 HTTP {status}）。',
+      blockedUnknown: '具体原因：还没拿到围栏的答复（插件刚启动或探测未完成）；稍等几秒看状态是否刷新。',
+      rawReason: '原始原因（英文，插件原文）：',
       retry: '立即重试',
       retrying: '重试中…',
       retryStarted: '已重新发起连接；状态稍后自动刷新。',
@@ -410,15 +419,22 @@ window.__ModuleLoader__.load({
       needOrigin: 'No public origin yet. Fill in “Public origin” below and save; the public entry point opens then (the local GUI on 127.0.0.1 is unaffected).',
       gateway: 'Gateway',
       tunnel: 'Tunnel',
-      fence: 'DSH fence',
+      fence: 'Security fence',
       off: 'off',
       listening: 'listening',
       fenceOk: 'that Host is accepted',
-      fenceBad: 'that Host is refused: start dsh web with --trusted-host',
+      fenceBad: 'this Host is refused: dsh web was started without --trusted-host',
+      fenceBadOtherHost: 'this Host is refused: dsh web trusts a different host',
       tunnelFailed: 'The tunnel is not up:',
       tunnelFailedHint: 'That is ssh2\u2019s own reason (ECONNREFUSED usually means the host or port is wrong). Fix it and save to retry.',
       tunnelBlocked: 'The tunnel is closed: the DSH trust fence refuses this Host.',
       tunnelBlockedHint: 'Restart DSH as dsh --profile web --public-url <public origin>/ --trusted-host <host>. Until it accepts this Host, the public entry point stays closed \u2014 deliberately, not by accident.',
+      blockedNoFlag: 'Specifically: dsh web was started **without** --trusted-host, so it refused Host "{host}".',
+      blockedWrongHost: 'Specifically: dsh web trusts {trusted}, while this deployment publishes "{host}" \u2014 they disagree, so the fence refuses.',
+      blockedDespiteTrust: 'Specifically: dsh web declares it trusts "{host}", yet the fence still refuses it \u2014 check the spelling, any extra port, or whether another dsh process answers on 3080.',
+      blockedNoAnswer: 'Specifically: the local GUI has not confirmed it accepts this Host (its last answer was HTTP {status}).',
+      blockedUnknown: 'Specifically: no fence answer has arrived yet (the plugin just started or the probe is still running); watch the state line for a few seconds.',
+      rawReason: 'Raw reason (English, from the plugin):',
       retry: 'Retry now',
       retrying: 'Retrying\u2026',
       retryStarted: 'A new connection attempt was started; the state refreshes on its own.',
@@ -802,6 +818,31 @@ window.__ModuleLoader__.load({
           }
         }
 
+        /**
+         * Why the fence refused this Host, in the operator's language.
+         *
+         * The Host's own `lastError` for a blocked tunnel is the English sentence it
+         * prints on the console, and showing that as the page's explanation made a
+         * localized page read half-translated. Every fact needed to say it properly
+         * is in the payload (`fence`, `launch`, the published origin), so the page
+         * says it itself and keeps the raw text only where it is the evidence.
+         * @param live - the live status payload.
+         * @returns the localized explanation.
+         */
+        const blockedExplanation = function (live: Status): string {
+          const fence = live.runtime.fence
+          if (fence === null) return t('blockedUnknown')
+          const published = typeof live.effective.publicOrigin === 'string' ? hostOf(live.effective.publicOrigin) : null
+          const authority = published ?? fence.authority
+          if (fence.status !== 403) return t('blockedNoAnswer').replace('{status}', String(fence.status))
+          const trusted = live.runtime.launch?.trustedHosts ?? null
+          if (trusted === null || trusted.length === 0) return t('blockedNoFlag').replace('{host}', authority)
+          if (trusted.some(entry => entry.toLowerCase() === authority.toLowerCase())) {
+            return t('blockedDespiteTrust').replace('{host}', authority)
+          }
+          return t('blockedWrongHost').replace('{host}', authority).replace('{trusted}', trusted.join(', '))
+        }
+
         /** @returns validation problems keyed by field path. */
         const problems = function (): Record<string, string> {
           const found: Record<string, string> = {}
@@ -1067,25 +1108,36 @@ window.__ModuleLoader__.load({
         ]))
         if (status !== null && status.runtime.tunnel !== null) {
           const tunnel = status.runtime.tunnel
-          // The kind is the actionable half of a failure ("auth" says which field to
-          // look at), so it rides beside the state, and the countdown answers the
-          // one question a retrying tunnel raises: how long until it tries again.
-          const countdown = tunnel.nextRetryAt === null
+          // The client bundle and the Host half reload independently (this plugin's
+          // row restarts on save, and a page can outlive it), so every field added
+          // later is read defensively: an older payload must render as "not there",
+          // never as `(undefined)` or `下次重试 NaNs`.
+          const kind = typeof tunnel.kind === 'string' && tunnel.kind !== '' ? ' (' + tunnel.kind + ')' : ''
+          const retryAt = typeof tunnel.nextRetryAt === 'number' && Number.isFinite(tunnel.nextRetryAt) ? tunnel.nextRetryAt : null
+          const countdown = retryAt === null
             ? ''
-            : ' · ' + t('nextRetry') + ' ' + String(Math.max(0, Math.round((tunnel.nextRetryAt - Date.now()) / 1000))) + 's'
+            : ' · ' + t('nextRetry') + ' ' + String(Math.max(0, Math.round((retryAt - Date.now()) / 1000))) + 's'
           facts.push(h('div', { className: 'sr-fact', key: 'tn' }, [
             h('span', { className: 'sr-dot' + (tunnel.state === 'listening' ? ' ok' : ' bad') }),
-            h('span', null, t('tunnel') + ': ' + tunnel.state
-              + (tunnel.kind === null ? '' : ' (' + tunnel.kind + ')')
+            h('span', null, t('tunnel') + ': ' + tunnel.state + kind
               + (tunnel.remote === null ? '' : ' → ' + tunnel.remote)
               + ' · ' + String(tunnel.attempts) + '×'
               + countdown),
           ]))
         }
         if (status !== null && status.runtime.fence !== null) {
+          // The row says which refusal this is, in one line, from the facts the Host
+          // reports: "you passed a different --trusted-host" is a different mistake
+          // from "you passed none", and both are different from a fence that refuses
+          // an authority its own launch arguments declare as trusted.
+          const fence = status.runtime.fence
+          const published = typeof status.effective.publicOrigin === 'string' ? hostOf(status.effective.publicOrigin) : null
+          const trusted = status.runtime.launch?.trustedHosts ?? null
+          const wrongHost = !fence.ok && trusted !== null && trusted.length > 0 && published !== null
+            && !trusted.some(entry => entry.toLowerCase() === published.toLowerCase())
           facts.push(h('div', { className: 'sr-fact', key: 'fc' }, [
-            h('span', { className: 'sr-dot' + (status.runtime.fence.ok ? ' ok' : ' bad') }),
-            h('span', null, t('fence') + ': ' + (status.runtime.fence.ok ? t('fenceOk') : t('fenceBad'))),
+            h('span', { className: 'sr-dot' + (fence.ok ? ' ok' : ' bad') }),
+            h('span', null, t('fence') + ': ' + (fence.ok ? t('fenceOk') : wrongHost ? t('fenceBadOtherHost') : t('fenceBad'))),
           ]))
         }
 
@@ -1126,7 +1178,10 @@ window.__ModuleLoader__.load({
         if (status !== null && status.runtime.tunnel !== null && status.runtime.tunnel.state === 'blocked') {
           banners.push(h('div', { className: 'sr-banner error', key: 'blocked' }, [
             h('div', null, t('tunnelBlocked')),
-            h('code', null, status.runtime.tunnel.lastError ?? ''),
+            // The explanation comes from the payload, in Chinese: the Host's own
+            // sentence for this state is a console line, and pasting it here was the
+            // only English on an otherwise localized page.
+            h('div', { className: 'sr-hint' }, blockedExplanation(status)),
             h('div', { className: 'sr-hint' }, t('tunnelBlockedHint')),
           ]))
         } else if (status !== null && status.runtime.tunnel !== null && status.runtime.tunnel.state !== 'listening'
@@ -1134,6 +1189,9 @@ window.__ModuleLoader__.load({
           const tunnel = status.runtime.tunnel
           banners.push(h('div', { className: 'sr-banner error', key: 'tunnel' }, [
             h('div', null, t('tunnelFailed')),
+            // Here the raw text IS the evidence (an ssh2 error nobody can translate
+            // usefully), so it stays — labelled, so its language is explained.
+            h('div', { className: 'sr-hint' }, t('rawReason')),
             h('code', null, tunnel.lastError),
             // The advice follows the classified kind, so the page names the field to
             // fix instead of handing over ssh2's wording and letting the operator

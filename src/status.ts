@@ -101,6 +101,15 @@ export interface SyncRemoteStatus {
     tunnel: TunnelSnapshot | null
     /** What the local GUI answered for the authority browsers use. */
     fence: { authority: string; status: number; ok: boolean } | null
+    /**
+     * What DSH itself was launched with, when the Host can report it.
+     *
+     * The settings page needs it to *explain* a refusal in the operator's own
+     * language: the Host's `lastError` is an English console sentence, and the one
+     * fact that turns "the fence refused this Host" into "you passed a different
+     * --trusted-host" is this list.
+     */
+    launch: { trustedHosts: string[]; publicUrl: string | null } | null
   }
 }
 
@@ -127,6 +136,8 @@ export interface StatusInput {
   gatewayListening: boolean
   tunnel: TunnelSnapshot | null
   fence: { authority: string; status: number } | null
+  /** `dsh web` launch facts, or null when the Host does not expose them. */
+  launch: { trustedHosts: string[]; publicUrl: string | null } | null
 }
 
 /**
@@ -188,6 +199,7 @@ export function buildStatus(input: StatusInput): SyncRemoteStatus {
       gateway: input.gatewayListening ? 'listening' : 'off',
       tunnel: input.tunnel,
       fence: input.fence === null ? null : { ...input.fence, ok: input.fence.status !== 403 },
+      launch: input.launch,
     },
   }
 }

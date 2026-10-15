@@ -613,29 +613,126 @@ await check('the release control appears only for a refused port, and only when 
   await settle()
 })
 
-await check('a blocked tunnel explains the flag instead of showing the ssh2 hint', async () => {
+await check('a blocked tunnel explains itself in Chinese, from the facts, not the console sentence', async () => {
   // `blocked` is a deliberate refusal, not a failure: the tunnel never dialed the
   // VPS, so the banner must name the `dsh web` flag. The generic ssh2 banner would
   // send the operator looking at ports and keys — and it would be a lie, because
   // nothing was attempted.
+  //
+  // The Host's own sentence for this state is written for the console (English), and
+  // pasting it into the banner was the only English on an otherwise Chinese page.
+  // The page now derives the explanation from `fence` + `launch`, so each of the
+  // three refusals reads differently and none of them is the raw text.
+  const saved = statusPayload
+  /** @param runtime - the runtime slice to render. */
+  const withRuntime = (runtime: Record<string, unknown>): void => {
+    statusPayload = { ...saved, effective: { ...saved.effective, publicOrigin: 'https://dsh.example.test' }, runtime: { ...saved.runtime, ...runtime } }
+    button(render(), '刷新状态').props.onClick()
+  }
+  const consoleSentence = 'the DSH browser-trust fence refused Host "dsh.example.test"; start the GUI with --trusted-host …'
+  const blocked = {
+    state: 'blocked', kind: null, attempts: 0, channels: 0, remote: 'vps:22', hostKey: null,
+    everListening: false, nextRetryAt: null, suspected: null, lastError: consoleSentence,
+  }
+
+  // (a) No flag at all: the most common mistake.
+  withRuntime({ tunnel: blocked, fence: { authority: 'dsh.example.test', status: 403, ok: false }, launch: { trustedHosts: [], publicUrl: null } })
+  await settle()
+  let text = renderedText(render())
+  assert.match(text, /隧道没有开启/)
+  assert.match(text, /没有\*\*加 --trusted-host/)
+  assert.equal(text.includes(consoleSentence), false, `the console sentence must not be the explanation:\n${text}`)
+  assert.equal(/上面是 ssh2 报的原始原因/u.test(text), false, `a blocked tunnel must not carry the ssh2 hint:\n${text}`)
+
+  // (b) A different host was trusted: the same refusal, a different fix.
+  withRuntime({ tunnel: blocked, fence: { authority: 'dsh.example.test', status: 403, ok: false }, launch: { trustedHosts: ['other.example.test'], publicUrl: null } })
+  await settle()
+  text = renderedText(render())
+  assert.match(text, /信任的是 other\.example\.test/)
+  assert.match(text, /安全围栏: 现 Host 被拒绝：DSH 信任的是别的域名/)
+
+  // (c) Nothing answered: the fence never decided, which is not a --trusted-host bug.
+  withRuntime({ tunnel: { ...blocked, lastError: 'the local GUI did not confirm it accepts Host …' }, fence: { authority: 'dsh.example.test', status: 404, ok: true }, launch: { trustedHosts: ['dsh.example.test'], publicUrl: null } })
+  await settle()
+  assert.match(renderedText(render()), /最近一次答复是 HTTP 404/)
+
+  statusPayload = saved
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+})
+
+await check('the fence row names the refusal the operator actually made', async () => {
+  const saved = statusPayload
+  /** @param fence - the fence slice to render. @param launch - the launch facts to render. */
+  const withFence = async (fence: Record<string, unknown>, launch: Record<string, unknown>): Promise<string> => {
+    statusPayload = { ...saved, effective: { ...saved.effective, publicOrigin: 'https://dsh.example.test' }, runtime: { ...saved.runtime, fence, launch } }
+    button(render(), '刷新状态').props.onClick()
+    // The refresh is a fetch: without settling, the tree still shows the payload
+    // from the previous case and every assertion below would read the same string.
+    await settle()
+    return renderedText(render())
+  }
+  assert.match(
+    await withFence({ authority: 'dsh.example.test', status: 401, ok: true }, { trustedHosts: ['dsh.example.test'], publicUrl: null }),
+    /安全围栏: 该 Host 被接受/,
+  )
+  assert.match(
+    await withFence({ authority: 'dsh.example.test', status: 403, ok: false }, { trustedHosts: [], publicUrl: null }),
+    /安全围栏: 现 Host 被拒绝，DSH 启动时未加 --trusted-host/,
+  )
+  assert.match(
+    await withFence({ authority: 'dsh.example.test', status: 403, ok: false }, { trustedHosts: ['other.example.test'], publicUrl: null }),
+    /安全围栏: 现 Host 被拒绝：DSH 信任的是别的域名/,
+  )
+  statusPayload = saved
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+})
+
+await check('an older Host payload renders as missing, not as undefined or NaN', async () => {
+  // The client bundle and the Host half reload independently: a page can be running
+  // this version against a Host half that predates `kind` and `nextRetryAt`. That has
+  // to read as "the field is not there", never as `(undefined)` or `下次重试 NaNs`.
+  const saved = statusPayload
+  statusPayload = {
+    ...saved,
+    runtime: {
+      ...saved.runtime,
+      tunnel: { state: 'reconnecting', attempts: 3, channels: 0, remote: 'vps:22', hostKey: null, lastError: 'connect ECONNREFUSED 1.2.3.4:22' },
+    },
+  }
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+  const text = renderedText(render())
+  assert.match(text, /隧道: reconnecting/, text)
+  assert.equal(/undefined/u.test(text), false, `no field may render as undefined:\n${text}`)
+  assert.equal(/NaN/u.test(text), false, `no field may render as NaN:\n${text}`)
+  statusPayload = saved
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+})
+
+await check('a failure banner labels the raw reason as the raw reason', async () => {
+  // The raw text stays for ssh2 failures — it is the evidence, and translating it
+  // would be inventing. It is labelled so a Chinese page carrying an English line
+  // reads as deliberate rather than as a half-finished translation.
   const saved = statusPayload
   statusPayload = {
     ...saved,
     runtime: {
       ...saved.runtime,
       tunnel: {
-        state: 'blocked', attempts: 0, channels: 0, remote: 'vps:22', hostKey: null,
-        lastError: 'the DSH browser-trust fence refused Host "dsh.example.test"; start the GUI with --trusted-host "dsh.example.test" (and --public-url https://dsh.example.test/), or every request through this gateway will 403 — the reverse tunnel stays closed until then',
+        state: 'reconnecting', kind: 'auth', attempts: 2, channels: 0, remote: 'vps:22', hostKey: null,
+        everListening: false, nextRetryAt: null, suspected: null,
+        lastError: 'client-authentication: All configured authentication methods failed',
       },
-      fence: { authority: 'dsh.example.test', status: 403, ok: false },
     },
   }
   button(render(), '刷新状态').props.onClick()
   await settle()
-  const text = flatten(render()).map((element) => JSON.stringify(element.props.children ?? '')).join('\n')
-  assert.match(text, /隧道没有开启/)
-  assert.match(text, /--trusted-host/)
-  assert.equal(/上面是 ssh2 报的原始原因/u.test(text), false, `a blocked tunnel must not carry the ssh2 hint:\n${text}`)
+  const text = renderedText(render())
+  assert.match(text, /原始原因（英文，插件原文）/)
+  assert.match(text, /All configured authentication methods failed/)
   statusPayload = saved
   button(render(), '刷新状态').props.onClick()
   await settle()

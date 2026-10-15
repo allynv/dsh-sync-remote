@@ -548,6 +548,7 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
           gatewayListening: now !== null,
           tunnel: tunnel === null ? null : tunnel.snapshot(),
           fence,
+          launch,
         })
       },
       mintEnrollment: async () => {
