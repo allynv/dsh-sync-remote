@@ -240,16 +240,19 @@ export function tunnelHostProblem(host: string): string | null {
 }
 
 /**
- * The identity of one tunnel configuration: the values a connection test
+ * The identity of one deployment configuration: the values a connection test
  * actually proves.
  *
- * `host`, `port`, `user`, the key file and its passphrase are what the test
- * dials with, so they are what a saved configuration is allowed to claim. The
- * passphrase never rides in the clear: the digest is salted with the state
+ * Everything here is exercised by `probeTunnel`: the SSH coordinates it dials with
+ * (`host`, `port`, `user`, the key file and its passphrase), the remote port it
+ * binds and then reaches through the public origin (`serverPort`), the local port it
+ * asks for a DSH answer (`clientPort`), and the origin that round trip goes to
+ * (`publicOrigin`). A value the test proves belongs here — leaving one out is how a
+ * hand-edited profile changes something the operator never verified.
+ *
+ * The passphrase never rides in the clear: the digest is salted with the state
  * file's own secret, so a leaked state file alone does not expose it to a
- * dictionary. Values the test does not exercise (`serverPort`, `clientPort`, the
- * public origin) are deliberately absent — changing them must not demand a new
- * test.
+ * dictionary.
  * @param config - the resolved configuration.
  * @param secret - the state file's secret, used as the salt.
  * @returns the fingerprint as lowercase hex.
@@ -264,6 +267,9 @@ export function tunnelFingerprint(config: ResolvedConfig, secret: string): strin
     user: config.tunnel.user,
     privateKeyFile: config.tunnel.privateKeyFile,
     passphrase,
+    serverPort: config.serverPort,
+    clientPort: config.target.port,
+    publicOrigin: config.publicOrigin,
   })).digest('hex')
 }
 

@@ -195,12 +195,17 @@ interface Minted {
 }
 
 /**
- * The tunnel values a connection test carries.
+ * The deployment values a connection test carries.
  *
  * Every field is optional: what the form cannot see is left out and the Host
  * merges the stored value in. `passphrase` may be `null`, which is how "this row
  * has none" is said out loud for the one case that needs it (clearing a
  * passphrase that used to be set).
+ *
+ * The last three are outside the tunnel half but inside what the test proves: the
+ * remote port Nginx reaches the tunnel on, the local port the gateway proxies to,
+ * and the public origin the round trip targets. Testing them is what catches "the
+ * tunnel works and the domain still 502s".
  */
 interface CandidatePatch {
   enabled?: boolean
@@ -209,6 +214,9 @@ interface CandidatePatch {
   user?: string
   privateKeyFile?: string
   passphrase?: string | null
+  serverPort?: number
+  clientPort?: number
+  publicOrigin?: string
 }
 
 /**
@@ -350,6 +358,22 @@ window.__ModuleLoader__.load({
       testing: '测试中…',
       testDone: '连接成功：已认证 {host}；服务器出示的主机密钥 {key}（与已固定一致）。现在可以保存。',
       testFailed: '测试失败：',
+      testFailIncomplete: '隧道还没配全：需要 VPS 地址、SSH 用户和私钥路径三样齐全。',
+      testFailHost: 'VPS 地址不是一个可用的主机名或 IP：检查「VPS 地址」的拼写（四段都必须在 0–255 之间，不能带端口或用户名）。',
+      testFailLocalGui: '本机「客户端端口」上没有 DSH 在监听——网关会把它反代进一个空洞，访客只会看到 502。确认它就是 dsh web 实际监听的端口。',
+      testFailKey: '私钥读不到或解析失败：检查「私钥绝对路径」，以及「私钥口令」（口令错也会报成解析失败）。',
+      testFailAuth: 'SSH 认证被拒：检查「SSH 用户」，以及这把公钥有没有写进那个用户的 authorized_keys。',
+      testFailHostKey: 'VPS 出示的主机密钥与已固定的不一致：可能换了机器，也可能这个地址不是原来的 VPS。确认后用「重新信任」更新。',
+      testFailDns: '这个地址解析不出来：检查「VPS 地址」的拼写和本机 DNS。',
+      testFailUnreachable: '连不上 VPS：地址写错、VPS 关机、sshd 没起、或「VPS 的 SSH 端口」写错——这几种在协议上无法区分，请逐个排查。',
+      testFailTimeout: '这个端口上没有 SSH 在应答（握手超时）：确认「VPS 的 SSH 端口」，以及防火墙/安全组没有丢弃。',
+      testFailDropped: 'SSH 会话在就绪前断开：稍后重试；持续出现就检查 VPS 负载与网络。',
+      testFailForward: 'VPS 拒绝监听「服务端端口」：端口已被占用（常见是上一次会话残留的 sshd），或 sshd 禁止了转发。',
+      testFailPublicPort: '公网域名没有回到本机：Nginx 到了 VPS，但「服务端端口」上没有隧道在监听。**把 Nginx 的 proxy_pass 端口改成与「服务端端口」一致**——改端口时必须先改 Nginx，再测试。',
+      testFailPublicUnreachable: '从这台机器访问不到公网地址：检查域名解析、证书，以及本机到公网的网络。',
+      testFailPublicWrong: '公网地址回了别的东西：这个域名没有指向本部署（Nginx 指到了别的服务，或 CDN 缓存了旧内容）。',
+      testFailPublicNoAnswer: '公网地址在超时时间内没有应答：检查 Nginx、防火墙与网络。',
+      testFailUnknown: '测试失败：',
       testNeedsSave: '隧道设置改了：先测试连接，成功了才会保存。',
       retriesStopped: '不会自动重试：修好之后保存，或点「立即重试」；若提示主机密钥不符，请点「重新信任」。',
       untested: 'untested（配置未验证）',
@@ -477,6 +501,22 @@ window.__ModuleLoader__.load({
       testing: 'Testing…',
       testDone: 'Connected: authenticated as {host}; the server presented host key {key} (matches the pinned one). You can save now.',
       testFailed: 'The test failed: ',
+      testFailIncomplete: 'The tunnel is incomplete: it needs a VPS address, an SSH user, and a private key path.',
+      testFailHost: 'The VPS address cannot be a host: check its spelling (four octets 0–255, no port, no user@).',
+      testFailLocalGui: 'Nothing answers like DSH on 客户端端口 (clientPort) — the gateway would proxy into a void and every visitor would see 502. Make sure it is the port dsh web listens on.',
+      testFailKey: 'The private key could not be read or parsed: check 私钥绝对路径 and 私钥口令 (a wrong passphrase reads as a parse failure too).',
+      testFailAuth: 'SSH authentication was refused: check 服务端 SSH 用户 and whether this public key is in that user\'s authorized_keys.',
+      testFailHostKey: 'The VPS presented a host key that does not match the pinned one: it may have been re-installed, or this address may not be your VPS. Use 重新信任 once you are sure.',
+      testFailDns: 'That address does not resolve: check the spelling of VPS 地址 and this machine\'s DNS.',
+      testFailUnreachable: 'Cannot reach the VPS: wrong address, VPS down, sshd not running, or a wrong VPS 的 SSH 端口 — the protocol cannot tell these apart, so check them one by one.',
+      testFailTimeout: 'No SSH answer on that port (handshake timeout): confirm VPS 的 SSH 端口, and that no firewall or security group drops it.',
+      testFailDropped: 'The SSH session closed before it was ready: retry; if it keeps happening, look at VPS load and the network.',
+      testFailForward: 'The VPS refused to listen on 服务端端口: the port is already held (usually a previous session\'s sshd), or sshd forbids forwarding.',
+      testFailPublicPort: 'The public address did not come back here: Nginx reached the VPS, but no tunnel was listening on 服务端端口. Set Nginx\'s proxy_pass to that same port — when the port changes, change Nginx first, then test.',
+      testFailPublicUnreachable: 'This machine cannot reach its own public address: check DNS, the certificate, and outbound network access.',
+      testFailPublicWrong: 'The public address answered with something else: the domain does not lead to this deployment (Nginx points elsewhere, or a CDN cached the old site).',
+      testFailPublicNoAnswer: 'The public address did not answer within the timeout: check Nginx, the firewall, and the network.',
+      testFailUnknown: 'The test failed: ',
       testNeedsSave: 'The tunnel settings changed: they are tested first, and only saved when the test passes.',
       retriesStopped: 'It will not retry on its own: fix it and save, or press Retry now; if the host key does not match, press Trust again.',
       untested: 'untested (configuration not verified)',
@@ -594,14 +634,18 @@ window.__ModuleLoader__.load({
      *
      * Exactly what `tunnelFingerprint` covers: those are the values a dial
      * exercises, so those are the ones that may not be persisted untested.
-     * `serverPort`, `clientPort` and the public origin stay outside both — a dial
-     * proves nothing about them, and demanding a test for them would only add a
-     * click. The enable switch is outside too: flipping it cannot invalidate a
-     * proof, and turning it on with unproven values is what the Host's own
-     * `untested` gate is for.
+     *
+     * The server port, the client port, and the public origin are in the list now
+     * because the test exercises them too: it binds the remote port, asks the local
+     * port for a DSH answer, and proves the public origin comes back here. Changing
+     * any of them can turn a working deployment into a 502, which is exactly what the
+     * gate exists to catch. The enable switch stays outside: flipping it cannot
+     * invalidate a proof, and turning it on with unproven values is what the Host's
+     * own `untested` gate is for.
      */
     const GATED_PATHS = new Set([
       'tunnel.host', 'tunnel.port', 'tunnel.user', 'tunnel.privateKeyFile', 'tunnel.passphrase',
+      'serverPort', 'clientPort', 'publicOrigin',
     ])
 
     const CSS = `
@@ -872,6 +916,11 @@ window.__ModuleLoader__.load({
             port: Number(valueOf('tunnel.port')),
             user: valueOf('tunnel.user'),
             privateKeyFile: valueOf('tunnel.privateKeyFile'),
+            // The deployment values outside the tunnel half: the test proves these too
+            // (remote port bound and reached, local port asked, origin round-tripped).
+            serverPort: Number(valueOf('serverPort')),
+            clientPort: Number(valueOf('clientPort')),
+            publicOrigin: valueOf('publicOrigin'),
           }
           const enabled = valueOf('tunnel.enabled')
           // "inherit" is not a value: it means the three coordinates decide.
@@ -894,10 +943,54 @@ window.__ModuleLoader__.load({
         }
 
         /**
-         * Dial the candidate once, on the Host, and report what came back.
+         * Which dictionary entry names the failure the Host classified.
          *
-         * Nothing is written here: recording the fingerprint is the Host's job,
-         * and it does that only when the dial actually authenticated.
+         * The Host reports a stable `code` (and the stage it belongs to) precisely so
+         * this page can say it in the operator's language; the raw text it also sends
+         * is ssh2's or an HTTP status, and translating those would be inventing.
+         */
+        const TEST_FAILURE_KEYS: Record<string, string> = {
+          'incomplete': 'testFailIncomplete',
+          'host-syntax': 'testFailHost',
+          'local-gui-missing': 'testFailLocalGui',
+          'key-read': 'testFailKey',
+          'key-rejected': 'testFailKey',
+          'auth': 'testFailAuth',
+          'host-key': 'testFailHostKey',
+          'dns': 'testFailDns',
+          'unreachable': 'testFailUnreachable',
+          'handshake-timeout': 'testFailTimeout',
+          'dropped': 'testFailDropped',
+          'forward-refused': 'testFailForward',
+          'public-port-mismatch': 'testFailPublicPort',
+          'public-unreachable': 'testFailPublicUnreachable',
+          'public-wrong-service': 'testFailPublicWrong',
+          'public-no-answer': 'testFailPublicNoAnswer',
+        }
+
+        /**
+         * The page's own sentence for a failed test, with the Host's text below it.
+         * @param payload - the failure body, when there was one.
+         * @param status - the HTTP status, for the case where there was not.
+         * @returns the two lines to show.
+         */
+        const describeTestFailure = function (payload: { code?: unknown, error?: unknown, evidence?: unknown } | null, status: number): string {
+          const code = typeof payload?.code === 'string' ? payload.code : ''
+          const key = TEST_FAILURE_KEYS[code]
+          const lead = key === undefined ? t('testFailed') : t(key)
+          const raw = typeof payload?.evidence === 'string' && payload.evidence !== ''
+            ? payload.evidence
+            : typeof payload?.error === 'string' && payload.error !== ''
+              ? payload.error
+              : 'HTTP ' + String(status)
+          return lead + '\n' + t('rawReason') + ' ' + raw
+        }
+
+        /**
+         * Walk the whole publish path, on the Host, and report what came back.
+         *
+         * Nothing is written here: recording the fingerprint is the Host's job, and it
+         * does that only when the test proved the deployment end to end.
          * @param candidate - the values to prove.
          * @returns whether the test passed.
          */
@@ -909,9 +1002,13 @@ window.__ModuleLoader__.load({
             body: JSON.stringify(candidate),
           })
             .then(async (response) => {
-              const payload = (await response.json().catch(() => null)) as { ok?: boolean, hostKey?: unknown, error?: unknown } | null
+              const payload = (await response.json().catch(() => null)) as
+                { ok?: boolean, hostKey?: unknown, error?: unknown, code?: unknown, evidence?: unknown } | null
               if (!response.ok || payload === null || payload.ok !== true) {
-                throw new Error(payload && payload.error ? String(payload.error) : 'HTTP ' + String(response.status))
+                // A failed test is a normal outcome the page explains, not an exception:
+                // the sentence is composed here so it arrives in the page's language.
+                setMessage(describeTestFailure(payload, response.status))
+                return false
               }
               setMessage(t('testDone')
                 .replace('{host}', String(candidate.user ?? '') + '@' + String(candidate.host ?? ''))
@@ -919,6 +1016,8 @@ window.__ModuleLoader__.load({
               return true
             })
             .catch((error: unknown) => {
+              // The request itself failed (the Host route is gone, or the page lost the
+              // connection): that is not one of the stages, so it keeps its wording.
               setMessage(t('testFailed') + ' ' + (error instanceof Error ? error.message : String(error)))
               return false
             })

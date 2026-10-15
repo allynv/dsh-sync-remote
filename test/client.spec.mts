@@ -154,7 +154,7 @@ let statusPayload: Record<string, any> = {}
 /** Every path the page fetched, so an action can be proven to have called its route. */
 const fetchedPaths: string[] = []
 /** What the next connection test answers; flipped by the checks below. */
-let testResult: { ok: boolean, error?: string } = { ok: true }
+let testResult: { ok: boolean, error?: string, code?: string, stage?: string, evidence?: string } = { ok: true }
 
 const ctx = {
   effect(factory: () => unknown, label?: string) {
@@ -295,7 +295,14 @@ statusPayload = {
   if (String(path).includes('tunnel.test')) {
     return testResult.ok
       ? { ok: true, status: 200, json: async () => ({ ok: true, hostKey: 'SHA256:test', verifiedAt: 1, restarted: false }) }
-      : { ok: false, status: 409, json: async () => ({ error: testResult.error ?? 'the test failed' }) }
+      : {
+          ok: false,
+          status: 409,
+          json: async () => ({
+            error: testResult.error ?? 'the test failed',
+            ...testResult.code === undefined ? {} : { code: testResult.code, stage: testResult.stage, evidence: testResult.evidence },
+          }),
+        }
   }
   return { ok: true, status: 200, json: async () => statusPayload }
 }
@@ -623,6 +630,43 @@ await check('a save that changes the tunnel is tested first, and written only if
   button(render(), '刷新状态').props.onClick()
   await settle()
   mutations.length = before
+})
+
+await check('a failed test names the field in the page language, with the raw answer as evidence', async () => {
+  // The stages exist so the page can say what to fix in the operator's language; the
+  // Host's own text is ssh2's wording or an HTTP status, and translating either would
+  // be inventing, so it stays below the sentence as labelled evidence.
+  const samples = [
+    // The gap this feature closes: SSH, auth and the port bind all succeeded, and the
+    // deployment is still unreachable because Nginx names another port.
+    { code: 'public-port-mismatch', stage: 'public', evidence: 'http://dsh.example.test/__dsh-sync-remote-probe/ab12 → HTTP 502', expect: /proxy_pass/u },
+    { code: 'forward-refused', stage: 'forward', evidence: 'Unable to bind to 127.0.0.1:3090 on the remote host', expect: /服务端端口/u },
+    { code: 'local-gui-missing', stage: 'local-gui', evidence: 'nothing answers http://127.0.0.1:1/', expect: /客户端端口/u },
+    { code: 'public-wrong-service', stage: 'public', evidence: 'HTTP 200 without the nonce', expect: /没有指向本部署/u },
+    { code: 'auth', stage: 'ssh', evidence: 'client-authentication: All configured authentication methods failed', expect: /authorized_keys/u },
+  ]
+  for (const sample of samples) {
+    testResult = { ok: false, code: sample.code, stage: sample.stage, evidence: sample.evidence }
+    fetchedPaths.length = 0
+    button(render(), '测试连接').props.onClick()
+    await settle()
+    const text = renderedText(render())
+    assert.match(text, sample.expect, `${sample.code} must be explained in the page's language:\n${text}`)
+    assert.match(text, /原始原因（英文，插件原文）：/u, `${sample.code} must label the raw answer:\n${text}`)
+    assert.ok(text.includes(sample.evidence), `${sample.code} must show the evidence verbatim:\n${text}`)
+    assert.equal(
+      text.includes(`测试失败： ${sample.evidence}`),
+      false,
+      `${sample.code} must not be shown as one untranslated sentence:\n${text}`,
+    )
+  }
+  // An unknown code still gets a sentence plus the evidence, so a newer Host cannot
+  // leave the page with a bare English line.
+  testResult = { ok: false, code: 'something-new', stage: 'public', evidence: 'HTTP 418' }
+  button(render(), '测试连接').props.onClick()
+  await settle()
+  assert.match(renderedText(render()), /测试失败：/u)
+  testResult = { ok: true }
 })
 
 await check('an unverified configuration is a state, not a failure, and carries its own test button', async () => {

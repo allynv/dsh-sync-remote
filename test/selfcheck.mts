@@ -16,7 +16,7 @@ import assert from 'node:assert/strict'
 import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server } from 'node:http'
-import { connect as connectTcp } from 'node:net'
+import { connect as connectTcp, createServer as createTcpServer } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { dirname, join } from 'node:path'
 import { ConfigError, defaultStateFile, resolveConfig, tunnelFingerprint, tunnelHostProblem, type ResolvedConfig } from '../src/config.ts'
@@ -170,22 +170,80 @@ function listen(server: Server): Promise<number> {
  *
  * ssh2 ships both halves, and the fixture is deliberately the simplest server
  * that can authenticate somebody: one host key, and an `authentication` handler
- * that either accepts the offered public key or refuses everything. The
- * fingerprint it presents is read back from a test rather than from ssh2's
- * internals.
+ * that either accepts the offered public key or refuses everything. It also
+ * implements the one piece of sshd the publish path needs — `tcpip-forward`, which
+ * means binding a port and handing each accepted connection back to the client —
+ * because the connection test binds the tunnel's port and proves the public origin
+ * reaches it. The fingerprint it presents is read back from a test rather than from
+ * ssh2's internals.
  * @param attempt - whether a `publickey` attempt should succeed.
+ * @param options - `forwards: false` makes the server refuse every remote forward,
+ * the way an sshd with `AllowTcpForwarding no` does.
  * @returns the ephemeral port it listens on and a disposer.
  */
-async function startSshServer(attempt: boolean): Promise<{ port: number, close(): Promise<void> }> {
+async function startSshServer(
+  attempt: boolean,
+  options: { forwards?: boolean } = {},
+): Promise<{ port: number, close(): Promise<void> }> {
   const { private: privateKey } = ssh2.utils.generateKeyPairSync('ed25519')
+  /** Listeners the client asked for, so `cancel-tcpip-forward` can close them. */
+  const forwards = new Map<string, ReturnType<typeof createTcpServer>>()
   const server = new ssh2.Server({ hostKeys: [privateKey] }, (client) => {
     // A probe that aborts mid-handshake (the host-key-mismatch case) makes the
     // server-side connection emit an error; the fixture has nothing to say about
     // it, and an unhandled one would take the whole check run down.
     client.on('error', () => {})
+    client.on('close', () => {
+      // A session that ends takes its forwards with it, exactly as sshd does: without
+      // this, a probe that hangs up right after releasing could leave a listener
+      // holding the test's port, and the next case would see a phantom conflict.
+      for (const [key, listener] of forwards) {
+        listener.close()
+        forwards.delete(key)
+      }
+    })
     client.on('authentication', (context) => {
       if (attempt && context.method === 'publickey') context.accept()
       else context.reject(['publickey'])
+    })
+    client.on('request', (accept, reject, name, info) => {
+      const ack = accept as (() => void) | undefined
+      const deny = reject as (() => void) | undefined
+      if (name !== 'tcpip-forward' && name !== 'cancel-tcpip-forward') {
+        deny?.()
+        return
+      }
+      if (options.forwards === false) {
+        deny?.()
+        return
+      }
+      const bindAddr = String((info as { bindAddr?: unknown }).bindAddr ?? '127.0.0.1')
+      const bindPort = Number((info as { bindPort?: unknown }).bindPort ?? 0)
+      const key = `${bindAddr}:${String(bindPort)}`
+      if (name === 'cancel-tcpip-forward') {
+        forwards.get(key)?.close()
+        forwards.delete(key)
+        ack?.()
+        return
+      }
+      // The same shape a real sshd has: listen on the requested loopback authority,
+      // and for every connection opening it, ask the client for a channel to carry it.
+      const listener = createTcpServer((socket) => {
+        client.forwardOut(bindAddr, bindPort, socket.remoteAddress ?? '127.0.0.1', socket.remotePort ?? 0, (error, stream) => {
+          if (error !== undefined && error !== null) {
+            socket.destroy()
+            return
+          }
+          stream.pipe(socket)
+          socket.pipe(stream)
+          stream.on('error', () => { socket.destroy() })
+        })
+      })
+      listener.once('error', () => { deny?.() })
+      listener.listen(bindPort, bindAddr, () => {
+        forwards.set(key, listener)
+        ack?.()
+      })
     })
   })
   server.on('error', () => {})
@@ -198,8 +256,66 @@ async function startSshServer(attempt: boolean): Promise<{ port: number, close()
   })
   return {
     port,
-    close: () => new Promise<void>((resolve) => { server.close(() => { resolve() }) }),
+    close: () => new Promise<void>((resolve) => {
+      for (const listener of forwards.values()) listener.close()
+      server.close(() => { resolve() })
+    }),
   }
+}
+
+/**
+ * A stand-in for the local DSH Web server: the answer its root gives an
+ * unauthenticated browser, which is what the connection test's local stage checks.
+ * @param status - the status to answer with.
+ * @returns the ephemeral port it listens on and a disposer.
+ */
+async function startFakeGui(status = 401): Promise<{ port: number, close(): Promise<void> }> {
+  const server = createServer((_request, response) => {
+    response.writeHead(status, { 'content-type': 'text/plain' })
+    response.end(status === 401 ? 'dsh web authentication required; reopen the URL printed by dsh web.' : 'ok')
+  })
+  const port = await listen(server)
+  return { port, close: () => new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => { resolve() }) }) }
+}
+
+/**
+ * A stand-in for Nginx: either it forwards every request to one port (the front
+ * door doing its job), or it answers a fixed body (the front door pointing somewhere
+ * else entirely).
+ * @param target - the upstream port, or null to answer `body` instead.
+ * @param body - what to answer when `target` is null.
+ * @returns the ephemeral port it listens on and a disposer.
+ */
+async function startFakeNginx(target: number | null, body = '<html>not this deployment</html>'): Promise<{ port: number, close(): Promise<void> }> {
+  const server = createServer((request, response) => {
+    if (target === null) {
+      response.writeHead(200, { 'content-type': 'text/html' })
+      response.end(body)
+      return
+    }
+    const upstream = httpRequest({
+      host: '127.0.0.1',
+      port: target,
+      method: request.method ?? 'GET',
+      path: request.url ?? '/',
+      headers: { host: `127.0.0.1:${String(target)}` },
+    }, (answer) => {
+      const chunks: Buffer[] = []
+      answer.on('data', (chunk: Buffer) => chunks.push(chunk))
+      answer.on('end', () => {
+        response.writeHead(answer.statusCode ?? 502, answer.headers)
+        response.end(Buffer.concat(chunks))
+      })
+    })
+    upstream.on('error', () => {
+      // What a real Nginx does when its upstream has nothing behind it.
+      response.writeHead(502, { 'content-type': 'text/html' })
+      response.end('<html><head><title>502 Bad Gateway</title></head></html>')
+    })
+    request.pipe(upstream)
+  })
+  const port = await listen(server)
+  return { port, close: () => new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => { resolve() }) }) }
 }
 
 /**
@@ -809,16 +925,17 @@ await check('the fingerprint names exactly the values a connection test proves',
     'the passphrase digest is salted with the state secret',
   )
   assert.equal(tunnelFingerprint(base, 'other-secret'), fingerprint, 'nothing secret is in the identity without a passphrase')
-  // The values no dial exercises are deliberately outside it: changing them must
-  // not demand a new test.
-  const elsewhere = resolveConfig({
-    publicOrigin: 'https://other.example.test',
-    serverPort: 4090,
-    clientPort: 3081,
-    sessionTtlHours: 24,
-    tunnel: { enabled: true, host: 'vps.example.com', port: 22, user: 'root', privateKeyFile: '/k/id_ed25519' },
-  })
-  assert.equal(tunnelFingerprint(elsewhere, secret), fingerprint)
+  // The three values outside the tunnel half are proven by the same test now — the
+  // remote port is bound and reached through the public origin, the client port is
+  // asked for a DSH answer — so they belong in the identity too. Leaving them out is
+  // exactly how a hand-edited profile changed something nobody had verified.
+  for (const [label, elsewhere] of [
+    ['the public origin', resolveConfig({ publicOrigin: 'https://other.example.test', serverPort: 3090, clientPort: 3080, sessionTtlHours: 24, tunnel: { enabled: true, host: 'vps.example.com', port: 22, user: 'root', privateKeyFile: '/k/id_ed25519' } })],
+    ['the server port', resolveConfig({ publicOrigin: 'https://dsh.example.test', serverPort: 4090, clientPort: 3080, sessionTtlHours: 24, tunnel: { enabled: true, host: 'vps.example.com', port: 22, user: 'root', privateKeyFile: '/k/id_ed25519' } })],
+    ['the client port', resolveConfig({ publicOrigin: 'https://dsh.example.test', serverPort: 3090, clientPort: 3081, sessionTtlHours: 24, tunnel: { enabled: true, host: 'vps.example.com', port: 22, user: 'root', privateKeyFile: '/k/id_ed25519' } })],
+  ] as const) {
+    assert.notEqual(tunnelFingerprint(elsewhere, secret), fingerprint, `${label} must change the fingerprint`)
+  }
 })
 
 await check('a proven configuration is remembered, trimmed, and read from older files', async () => {
@@ -892,50 +1009,234 @@ await check('the connection test authenticates, compares the pin, and never writ
   const tunnel = (overrides: Partial<ResolvedConfig['tunnel']>): ResolvedConfig['tunnel'] =>
     ({ ...testConfig().tunnel, enabled: true, host: '127.0.0.1', user: 'root', privateKeyFile: keyFile, ...overrides })
 
-  const accepting = await startSshServer(true)
+  /**
+   * A whole candidate deployment wired to local stand-ins.
+   *
+   * The test proves more than the SSH login now, so a candidate needs a local DSH to
+   * answer the client-port stage and a front door that leads back to the tunnel's
+   * port for the public stage. `serverPort` has to be a port the SSH fixture can
+   * really bind when the test asks it to forward.
+   */
+  const serverPort = await serverPortForTest()
+  const gui = await startFakeGui(401)
+  const nginx = await startFakeNginx(serverPort)
+  /** @param overrides - candidate tunnel fields this case varies. @returns the candidate configuration. */
+  const candidate = (overrides: Partial<ResolvedConfig['tunnel']> = {}): ResolvedConfig => testConfig({
+    publicOrigin: `http://127.0.0.1:${String(nginx.port)}`,
+    serverPort,
+    target: { host: '127.0.0.1', port: gui.port },
+    tunnel: { ...tunnel({ remoteHost: '127.0.0.1', remotePort: serverPort }), ...overrides, remotePort: serverPort },
+  })
+
   try {
-    const passed = await probeTunnel({ config: tunnel({ port: accepting.port }), pin: null, log: silentLog })
-    assert.equal(passed.ok, true, JSON.stringify(passed))
-    assert.match(String(passed.hostKey), /^SHA256:/)
+    const accepting = await startSshServer(true)
+    try {
+      const passed = await probeTunnel({ config: candidate({ port: accepting.port }), pin: null, liveRemotePort: null, statusToken: null, log: silentLog })
+      assert.equal(passed.ok, true, JSON.stringify(passed))
+      assert.match(String(passed.hostKey), /^SHA256:/)
+      // The public proof was the transient forward, and the nonce made the round trip.
+      assert.equal(passed.publicCheck, 'forward', JSON.stringify(passed))
 
-    // The pin is compared, not created: the same fingerprint passes…
-    const trusted = await probeTunnel({ config: tunnel({ port: accepting.port }), pin: passed.hostKey, log: silentLog })
-    assert.equal(trusted.ok, true, JSON.stringify(trusted))
-    // …and a different one fails with the fact, which is what the page needs to
-    // tell "your VPS was re-installed" from "this is not your VPS".
-    const foreign = hostKeyFingerprints(randomBytes(32)).base64
-    const mismatched = await probeTunnel({ config: tunnel({ port: accepting.port }), pin: foreign, log: silentLog })
-    assert.equal(mismatched.ok, false)
-    assert.equal(mismatched.kind, 'host-key')
-    assert.match(String(mismatched.reason), /does not match the trusted/)
+      // The pin is compared, not created: the same fingerprint passes…
+      const trusted = await probeTunnel({ config: candidate({ port: accepting.port }), pin: passed.hostKey, liveRemotePort: null, statusToken: null, log: silentLog })
+      assert.equal(trusted.ok, true, JSON.stringify(trusted))
+      // …and a different one fails with the fact, which is what the page needs to
+      // tell "your VPS was re-installed" from "this is not your VPS".
+      const foreign = hostKeyFingerprints(randomBytes(32)).base64
+      const mismatched = await probeTunnel({ config: candidate({ port: accepting.port }), pin: foreign, liveRemotePort: null, statusToken: null, log: silentLog })
+      assert.equal(mismatched.ok, false)
+      assert.equal(mismatched.code, 'host-key')
+      assert.equal(mismatched.stage, 'ssh')
+      assert.match(String(mismatched.evidence), /does not match the trusted/)
 
-    // A refused socket is classified exactly as the tunnel classifies it.
-    const refused = await probeTunnel({ config: tunnel({ port: 1 }), pin: null, log: silentLog })
-    assert.equal(refused.ok, false)
-    assert.equal(refused.kind, 'unreachable')
+      // A refused socket is classified exactly as the tunnel classifies it.
+      const refused = await probeTunnel({ config: candidate({ port: 1 }), pin: null, liveRemotePort: null, statusToken: null, log: silentLog })
+      assert.equal(refused.ok, false)
+      assert.equal(refused.code, 'unreachable')
 
-    // An impossible address never reaches the network at all.
-    const impossible = await probeTunnel({ config: tunnel({ host: '185.201.227.601' }), pin: null, log: silentLog })
-    assert.equal(impossible.ok, false)
-    assert.match(String(impossible.reason), /0–255/)
+      // An impossible address never reaches the network at all.
+      const impossible = await probeTunnel({ config: candidate({ host: '185.201.227.601' }), pin: null, liveRemotePort: null, statusToken: null, log: silentLog })
+      assert.equal(impossible.ok, false)
+      assert.equal(impossible.stage, 'syntax')
+      assert.match(String(impossible.evidence), /0–255/)
 
-    // A key file that is not there is named, not dialed.
-    const absent = await probeTunnel({ config: tunnel({ privateKeyFile: join(workdir, 'absent-probe-key') }), pin: null, log: silentLog })
-    assert.equal(absent.kind, 'key')
-    assert.match(String(absent.reason), /cannot read the SSH private key/)
+      // A key file that is not there is named, not dialed.
+      const absent = await probeTunnel({ config: candidate({ privateKeyFile: join(workdir, 'absent-probe-key') }), pin: null, liveRemotePort: null, statusToken: null, log: silentLog })
+      assert.equal(absent.code, 'key-read')
+      assert.equal(absent.stage, 'key')
+      assert.match(String(absent.evidence), /cannot read the SSH private key/)
+
+      // The local GUI is a stage of its own, and it comes before any dial: a
+      // deployment whose client port points into a void is a 502 for every visitor.
+      const noGui = testConfig({
+        publicOrigin: `http://127.0.0.1:${String(nginx.port)}`,
+        serverPort,
+        target: { host: '127.0.0.1', port: 1 },
+        tunnel: { ...tunnel({ port: accepting.port }), remotePort: serverPort },
+      })
+      const orphan = await probeTunnel({ config: noGui, pin: null, liveRemotePort: null, statusToken: null, log: silentLog })
+      assert.equal(orphan.ok, false)
+      assert.equal(orphan.stage, 'local-gui')
+      assert.equal(orphan.code, 'local-gui-missing')
+      assert.equal(orphan.hostKey, null, 'nothing may be dialed before the local stage passes')
+    } finally {
+      await accepting.close()
+    }
+
+    // The same fixture, refusing every identity: the test must say `auth`, which is
+    // the field-level answer for "the user or the key authorization is wrong".
+    const refusing = await startSshServer(false)
+    try {
+      const denied = await probeTunnel({ config: candidate({ port: refusing.port }), pin: null, liveRemotePort: null, statusToken: null, log: silentLog })
+      assert.equal(denied.ok, false)
+      assert.equal(denied.code, 'auth', JSON.stringify(denied))
+      assert.equal(denied.stage, 'ssh')
+    } finally {
+      await refusing.close()
+    }
+
+    // An sshd that refuses remote forwards fails the forward stage, not the auth one.
+    const noForwards = await startSshServer(true, { forwards: false })
+    try {
+      const denied = await probeTunnel({ config: candidate({ port: noForwards.port }), pin: null, liveRemotePort: null, statusToken: null, log: silentLog })
+      assert.equal(denied.ok, false)
+      assert.equal(denied.stage, 'forward')
+      assert.equal(denied.code, 'forward-refused')
+    } finally {
+      await noForwards.close()
+    }
   } finally {
-    await accepting.close()
+    await gui.close()
+    await nginx.close()
+  }
+})
+
+await check('a tunnel that authenticates against the wrong remote port fails the public round trip', async () => {
+  // The gap this closes: SSH succeeds, the port is bindable, and the deployment is
+  // still unreachable because Nginx's proxy_pass names a different port. Every stage
+  // before the round trip passes; only asking the public origin for a nonce this test
+  // invented can see the difference.
+  const { private: openSshKey } = ssh2.utils.generateKeyPairSync('ed25519')
+  const keyFile = join(workdir, 'id_ed25519-public-path')
+  await writeFile(keyFile, openSshKey, 'utf8')
+  const serverPort = await serverPortForTest()
+  const gui = await startFakeGui(401)
+  const sshServer = await startSshServer(true)
+  /** @param origin - the public origin to test against. @returns the candidate configuration. */
+  const candidate = (origin: string): ResolvedConfig => testConfig({
+    publicOrigin: origin,
+    serverPort,
+    target: { host: '127.0.0.1', port: gui.port },
+    tunnel: {
+      ...testConfig().tunnel, enabled: true, host: '127.0.0.1', port: sshServer.port,
+      user: 'root', privateKeyFile: keyFile, remoteHost: '127.0.0.1', remotePort: serverPort,
+    },
+  })
+  const run = (origin: string) => probeTunnel({ config: candidate(origin), pin: null, liveRemotePort: null, statusToken: null, log: silentLog })
+
+  // (a) The front door proxies a port the tunnel is not on.
+  const wrongPort = await startFakeNginx(1)
+  try {
+    const answer = await run(`http://127.0.0.1:${String(wrongPort.port)}`)
+    assert.equal(answer.ok, false, JSON.stringify(answer))
+    assert.equal(answer.stage, 'public')
+    assert.equal(answer.code, 'public-port-mismatch', JSON.stringify(answer))
+    assert.match(String(answer.evidence), /proxy_pass/)
+  } finally {
+    await wrongPort.close()
   }
 
-  // The same fixture, refusing every identity: the test must say `auth`, which is
-  // the field-level answer for "the user or the key authorization is wrong".
-  const refusing = await startSshServer(false)
+  // (b) The domain answers, but not with this deployment.
+  const impostor = await startFakeNginx(null)
   try {
-    const denied = await probeTunnel({ config: tunnel({ port: refusing.port }), pin: null, log: silentLog })
-    assert.equal(denied.ok, false)
-    assert.equal(denied.kind, 'auth', JSON.stringify(denied))
+    const answer = await run(`http://127.0.0.1:${String(impostor.port)}`)
+    assert.equal(answer.ok, false, JSON.stringify(answer))
+    assert.equal(answer.code, 'public-wrong-service', JSON.stringify(answer))
   } finally {
-    await refusing.close()
+    await impostor.close()
+  }
+
+  // (c) The public address cannot be reached from here at all.
+  const unreachable = await run('http://127.0.0.1:1')
+  assert.equal(unreachable.ok, false, JSON.stringify(unreachable))
+  assert.equal(unreachable.code, 'public-unreachable', JSON.stringify(unreachable))
+
+  // (d) Something else already holds the remote port: the forward stage says so,
+  // which is the stale-sshd case the release action exists for.
+  const nginx = await startFakeNginx(serverPort)
+  // The previous case's forward is released asynchronously, so wait for the port to
+  // be genuinely free instead of racing it (a fixed sleep would be a flaky guess).
+  assert.ok(
+    await untilAsync(async () => !await portAccepts('127.0.0.1', serverPort, 200), 5_000),
+    `the test's forward was never released on ${String(serverPort)}`,
+  )
+  const squatter = createServer(() => {})
+  await new Promise<void>((resolve, reject) => {
+    squatter.once('error', reject)
+    squatter.listen(serverPort, '127.0.0.1', () => { squatter.off('error', reject); resolve() })
+  })
+  try {
+    const answer = await run(`http://127.0.0.1:${String(nginx.port)}`)
+    assert.equal(answer.ok, false, JSON.stringify(answer))
+    assert.equal(answer.stage, 'forward')
+    assert.equal(answer.code, 'forward-refused', JSON.stringify(answer))
+    assert.match(String(answer.evidence), /ss -ltnp/)
+  } finally {
+    squatter.closeAllConnections()
+    await new Promise<void>((resolve) => { squatter.close(() => { resolve() }) })
+    await nginx.close()
+    await sshServer.close()
+    await gui.close()
+  }
+})
+
+await check('a running tunnel is used as the public proof instead of a second bind', async () => {
+  // A port can only be bound once. With the deployment already listening, a test that
+  // insisted on binding would report a failure for a deployment that works — so it
+  // asks the live chain for a signature only this gateway can produce instead.
+  const { private: openSshKey } = ssh2.utils.generateKeyPairSync('ed25519')
+  const keyFile = join(workdir, 'id_ed25519-live-proof')
+  await writeFile(keyFile, openSshKey, 'utf8')
+  const serverPort = await serverPortForTest()
+  const gui = await startFakeGui(401)
+  const sshServer = await startSshServer(true)
+  const token = 'status-token-for-the-live-proof'
+  const asked: string[] = []
+  const gateway = createServer((request, response) => {
+    asked.push(String(request.headers['x-dsh-gw-status'] ?? ''))
+    if (request.headers['x-dsh-gw-status'] !== token) {
+      response.writeHead(403, { 'content-type': 'text/plain' })
+      response.end('forbidden')
+      return
+    }
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify({ origin: 'https://dsh.example.test', tunnel: { state: 'listening' } }))
+  })
+  const gatewayPort = await listen(gateway)
+  const config: ResolvedConfig = testConfig({
+    publicOrigin: `http://127.0.0.1:${String(gatewayPort)}`,
+    serverPort,
+    target: { host: '127.0.0.1', port: gui.port },
+    tunnel: {
+      ...testConfig().tunnel, enabled: true, host: '127.0.0.1', port: sshServer.port,
+      user: 'root', privateKeyFile: keyFile, remoteHost: '127.0.0.1', remotePort: serverPort,
+    },
+  })
+  try {
+    const live = await probeTunnel({ config, pin: null, liveRemotePort: serverPort, statusToken: token, log: silentLog })
+    assert.equal(live.ok, true, JSON.stringify(live))
+    assert.equal(live.publicCheck, 'live', JSON.stringify(live))
+    assert.deepEqual(asked, [token], 'the live proof must carry the read-only status token')
+
+    // The same live chain with the wrong token is not this deployment's gateway.
+    const impostor = await probeTunnel({ config, pin: null, liveRemotePort: serverPort, statusToken: 'not-the-token', log: silentLog })
+    assert.equal(impostor.ok, false, JSON.stringify(impostor))
+    assert.equal(impostor.code, 'public-wrong-service', JSON.stringify(impostor))
+  } finally {
+    gateway.closeAllConnections()
+    await new Promise<void>((resolve) => { gateway.close(() => { resolve() }) })
+    await sshServer.close()
+    await gui.close()
   }
 })
 

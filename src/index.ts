@@ -645,7 +645,15 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
       if (patch.privateKeyFile !== undefined) tunnelRow.privateKeyFile = patch.privateKeyFile
       if (patch.passphrase === null) delete tunnelRow.passphrase
       else if (patch.passphrase !== undefined) tunnelRow.passphrase = patch.passphrase
-      return { ...base, tunnel: tunnelRow }
+      // The three values the test proves outside the tunnel half: the port Nginx
+      // reaches the tunnel on, the local port the gateway proxies to, and the origin
+      // the round trip goes to. They travel in the patch because the *draft* values
+      // are what has to be proven, not the saved ones.
+      const row: RowConfig = { ...base, tunnel: tunnelRow }
+      if (patch.serverPort !== undefined) row.serverPort = patch.serverPort
+      if (patch.clientPort !== undefined) row.clientPort = patch.clientPort
+      if (patch.publicOrigin !== undefined) row.publicOrigin = patch.publicOrigin
+      return row
     }
 
     const source: RouteSource = {
@@ -754,12 +762,30 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
         }
         probingTunnel = true
         try {
-          const result = await probeTunnel({ config: candidate.tunnel, pin: state.sshHostKey, log })
+          const result = await probeTunnel({
+            config: candidate,
+            pin: state.sshHostKey,
+            // The port the *running* tunnel already holds, so the test can tell "this
+            // deployment owns that port" from "something else does". Without it, a
+            // test of unchanged values would try to bind a port a healthy deployment
+            // is already listening on and report a false failure.
+            liveRemotePort: tunnel !== null && tunnel.snapshot().state === 'listening' ? resolved.tunnel.remotePort : null,
+            statusToken: typeof state.statusToken === 'string' ? state.statusToken : null,
+            log,
+          })
           if (!result.ok) {
-            return { ok: false, reason: result.reason ?? 'the connection test failed' }
+            return {
+              ok: false,
+              // The English evidence stays for the log; the page renders `code`.
+              reason: result.evidence ?? 'the connection test failed',
+              ...result.stage === null ? {} : { stage: result.stage },
+              ...result.code === null ? {} : { code: result.code },
+              ...result.evidence === null ? {} : { evidence: result.evidence },
+            }
           }
           const tested = tunnelFingerprint(candidate, state.secret)
           await store.rememberTunnelTest(tested, result.hostKey)
+          log.info(`dsh-sync-remote: connection test passed (${result.publicCheck === 'live' ? 'through the live tunnel' : 'with a transient forward'}); the configuration's fingerprint is recorded`)
           // Testing the values that are already running is how an unverified
           // deployment comes back without a save and a row reload.
           let restarted = false

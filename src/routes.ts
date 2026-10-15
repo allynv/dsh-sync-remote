@@ -53,6 +53,12 @@ export interface TunnelTestPatch {
   user?: string
   privateKeyFile?: string
   passphrase?: string | null
+  /** The VPS-side port Nginx reaches the tunnel on; proven by the public round trip. */
+  serverPort?: number
+  /** The local DSH Web port the gateway proxies to; proven by asking it for an answer. */
+  clientPort?: number
+  /** The public origin the round trip targets. */
+  publicOrigin?: string
 }
 
 /** One exact Fetch route, in the shape `ctx.connection.fetch.register` takes. */
@@ -98,18 +104,20 @@ export interface RouteSource {
    */
   retryTunnel(): Promise<{ ok: true } | { ok: false; reason: string }>
   /**
-   * Prove a candidate tunnel configuration by dialing it once.
+   * Prove a candidate deployment configuration by walking the whole publish path.
    *
-   * The settings page calls this before every write that touches the tunnel, and
-   * the running plugin refuses to dial a configuration this has not passed for.
-   * It only ever reads and dials: no remote forward is requested and nothing is
-   * bound on the VPS.
+   * The settings page calls this before every write that touches the tunnel, and the
+   * running plugin refuses to dial a configuration this has not passed for. It dials
+   * SSH, binds the remote port (and releases it), and proves the public origin comes
+   * back to this process — because a tunnel that authenticates against the wrong
+   * remote port is a deployment nobody can reach.
    * @param patch - the draft values from the form; everything omitted comes from
    * the current row.
-   * @returns the presented host key on success, or why the dial failed.
+   * @returns the presented host key on success, or which stage failed and why.
    */
   testTunnel(patch: TunnelTestPatch): Promise<
-    { ok: true; hostKey: string | null; verifiedAt: number; restarted: boolean } | { ok: false; reason: string }
+    | { ok: true; hostKey: string | null; verifiedAt: number; restarted: boolean }
+    | { ok: false; reason: string; stage?: string; code?: string; evidence?: string }
   >
   /**
    * End an sshd on the VPS that still holds the tunnel port.
@@ -170,6 +178,18 @@ function parseTunnelTestPatch(body: unknown): { patch: TunnelTestPatch } | { err
       return { error: '"passphrase" must be a string or null' }
     }
     patch.passphrase = source.passphrase
+  }
+  for (const field of ['serverPort', 'clientPort'] as const) {
+    const value = source[field]
+    if (value === undefined) continue
+    if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+      return { error: `"${field}" must be a whole number` }
+    }
+    patch[field] = value
+  }
+  if (source.publicOrigin !== undefined) {
+    if (typeof source.publicOrigin !== 'string') return { error: '"publicOrigin" must be a string' }
+    patch.publicOrigin = source.publicOrigin
   }
   return { patch }
 }
@@ -289,9 +309,10 @@ export function registerRoutes(registry: RouteRegistry, source: RouteSource, log
       if ('error' in parsed) return json({ error: parsed.error }, 400)
       try {
         const result = await source.testTunnel(parsed.patch)
-        // A failed test is a state the page renders ("these values do not
-        // work"), never a server error.
-        return result.ok ? json(result) : json({ error: result.reason }, 409)
+        // A failed test is a state the page renders ("these values do not work"),
+        // never a server error. The stage and code travel with the reason so the page
+        // can say it in the operator's own language and keep the raw text as evidence.
+        return result.ok ? json(result) : json({ error: result.reason, stage: result.stage, code: result.code, evidence: result.evidence }, 409)
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error)
         log.error(`dsh-sync-remote: the connection test failed unexpectedly: ${reason}`)
