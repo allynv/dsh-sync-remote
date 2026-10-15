@@ -653,6 +653,8 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
       if (patch.serverPort !== undefined) row.serverPort = patch.serverPort
       if (patch.clientPort !== undefined) row.clientPort = patch.clientPort
       if (patch.publicOrigin !== undefined) row.publicOrigin = patch.publicOrigin
+      // Not proven by the test, but required to resolve the candidate at all.
+      if (patch.sessionTtlHours !== undefined) row.sessionTtlHours = patch.sessionTtlHours
       return row
     }
 
@@ -741,9 +743,6 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
         return { ok: true }
       },
       testTunnel: async (patch) => {
-        if (resolved === null || store === null || state === null) {
-          return { ok: false, reason: 'no tunnel is configured yet, so there is nothing to test' }
-        }
         if (probingTunnel) {
           return { ok: false, reason: 'a connection test is already running' }
         }
@@ -751,26 +750,41 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
         // the fingerprint recorded here is exactly the one `apply()` computes for
         // the saved values — and a value the resolver refuses is named now rather
         // than surfacing later as a tunnel that cannot start.
+        //
+        // Deliberately NOT conditioned on the saved row resolving. On a fresh install
+        // nothing is saved yet: the form on screen is the only description of the
+        // deployment, and this test is what the page's save gate runs *before* the save
+        // that would configure the row. Requiring a resolvable row here made the first
+        // save impossible — the page could never get past its own gate.
         let candidate: ResolvedConfig
         try {
           candidate = resolveConfig(candidateRow(patch))
         } catch (error) {
-          return { ok: false, reason: reason(error) }
+          // A half-filled form is the normal first state of a new install: name the box
+          // the resolver wants (the message carries the field path) instead of reporting
+          // a failure the operator cannot act on.
+          return { ok: false, reason: reason(error), stage: 'syntax', code: 'incomplete', evidence: reason(error) }
         }
         if (!candidate.tunnel.enabled) {
           return { ok: false, reason: 'the tunnel is switched off, so there is nothing to test' }
         }
+        // The state file is where a proven configuration is recorded, and `apply()` only
+        // builds one for a row that already resolves. A row that has never been saved has
+        // none, so build it here from the candidate's own path rather than leaving the
+        // first save ungated.
+        const liveStore = store ?? new StateStore(candidate.stateFile)
+        const liveState = state ?? await liveStore.load()
         probingTunnel = true
         try {
           const result = await probeTunnel({
             config: candidate,
-            pin: state.sshHostKey,
+            pin: liveState.sshHostKey,
             // The port the *running* tunnel already holds, so the test can tell "this
             // deployment owns that port" from "something else does". Without it, a
             // test of unchanged values would try to bind a port a healthy deployment
             // is already listening on and report a false failure.
-            liveRemotePort: tunnel !== null && tunnel.snapshot().state === 'listening' ? resolved.tunnel.remotePort : null,
-            statusToken: typeof state.statusToken === 'string' ? state.statusToken : null,
+            liveRemotePort: resolved !== null && tunnel !== null && tunnel.snapshot().state === 'listening' ? resolved.tunnel.remotePort : null,
+            statusToken: typeof liveState.statusToken === 'string' ? liveState.statusToken : null,
             log,
           })
           if (!result.ok) {
@@ -783,13 +797,13 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
               ...result.evidence === null ? {} : { evidence: result.evidence },
             }
           }
-          const tested = tunnelFingerprint(candidate, state.secret)
-          await store.rememberTunnelTest(tested, result.hostKey)
+          const tested = tunnelFingerprint(candidate, liveState.secret)
+          await liveStore.rememberTunnelTest(tested, result.hostKey)
           log.info(`dsh-sync-remote: connection test passed (${result.publicCheck === 'live' ? 'through the live tunnel' : 'with a transient forward'}); the configuration's fingerprint is recorded`)
           // Testing the values that are already running is how an unverified
           // deployment comes back without a save and a row reload.
           let restarted = false
-          if (tunnel !== null && startTunnel !== null && tested === tunnelFingerprint(resolved, state.secret)) {
+          if (resolved !== null && tunnel !== null && startTunnel !== null && tested === tunnelFingerprint(resolved, liveState.secret)) {
             await tunnel.stop()
             await startTunnel()
             restarted = true

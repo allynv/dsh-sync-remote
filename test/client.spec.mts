@@ -155,6 +155,8 @@ let statusPayload: Record<string, any> = {}
 const fetchedPaths: string[] = []
 /** What the next connection test answers; flipped by the checks below. */
 let testResult: { ok: boolean, error?: string, code?: string, stage?: string, evidence?: string } = { ok: true }
+/** Every candidate the page sent to the test route, so its shape can be asserted. */
+const testBodies: Record<string, unknown>[] = []
 
 const ctx = {
   effect(factory: () => unknown, label?: string) {
@@ -287,8 +289,14 @@ statusPayload = {
   runtime: { gateway: 'listening', tunnel: { state: 'listening', attempts: 0, channels: 0, remote: 'vps:22', hostKey: null, lastError: null }, fence: { authority: 'dsh.example.test', status: 401, ok: true } },
 }
 
-;(globalThis as any).fetch = async (path: string): Promise<any> => {
+;(globalThis as any).fetch = async (path: string, init?: { body?: string }): Promise<any> => {
   fetchedPaths.push(String(path))
+  if (String(path).includes('tunnel.test') && typeof init?.body === 'string') {
+    // The page's candidate is what the Host resolves and dials, so every test that comes
+    // through here is worth keeping: a missing required field is a bug the Host can only
+    // report as "incomplete".
+    testBodies.push(JSON.parse(init.body) as Record<string, unknown>)
+  }
   if (String(path).includes('enroll.mint')) return { ok: true, status: 200, json: async () => ({ url: 'https://dsh.example.test/auth?token=x', qr: 'data:image/svg+xml;base64,AA', expiresAt: Date.now() + 600_000 }) }
   // The connection test answers both ways: a pass proves the candidate, a
   // failure must stop the write that was waiting on it.
@@ -611,6 +619,17 @@ await check('a save that changes the tunnel is tested first, and written only if
   )
   assert.equal(mutations.length, before, 'a failed connection test must persist nothing')
   assert.match(renderedText(render()), /ECONNREFUSED/)
+
+  // The candidate has to be a configuration the Host can *resolve*, or the gate reports
+  // "incomplete" for a field the operator already filled in — which is exactly how a
+  // fresh install became impossible to save (the page never sent `sessionTtlHours`).
+  const tested = testBodies[testBodies.length - 1]
+  for (const field of ['host', 'port', 'user', 'privateKeyFile', 'publicOrigin', 'serverPort', 'clientPort', 'sessionTtlHours']) {
+    assert.ok(
+      tested[field] !== undefined && tested[field] !== null && tested[field] !== '',
+      `the test candidate must carry ${field}: ${JSON.stringify(tested)}`,
+    )
+  }
 
   // (b) The same draft, proven: now the write goes through.
   testResult = { ok: true }

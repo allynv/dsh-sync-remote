@@ -217,6 +217,13 @@ interface CandidatePatch {
   serverPort?: number
   clientPort?: number
   publicOrigin?: string
+  /**
+   * The session lifetime travels with the candidate even though the test proves nothing
+   * about it: the candidate has to *resolve* to be dialed, and the resolver requires it.
+   * Leaving it out was what made the first save on a fresh install unfixable — the page
+   * sent a patch the resolver refused for a field the operator had already filled in.
+   */
+  sessionTtlHours?: number
 }
 
 /**
@@ -358,7 +365,7 @@ window.__ModuleLoader__.load({
       testing: '测试中…',
       testDone: '连接成功：已认证 {host}；服务器出示的主机密钥 {key}（与已固定一致）。现在可以保存。',
       testFailed: '测试失败：',
-      testFailIncomplete: '隧道还没配全：需要 VPS 地址、SSH 用户和私钥路径三样齐全。',
+      testFailIncomplete: '配置还没填全——下面「原始原因」那一行会点名缺的是哪一项（VPS 地址、SSH 用户、私钥路径、公网地址、服务端端口、客户端端口都是必填的）。',
       testFailHost: 'VPS 地址不是一个可用的主机名或 IP：检查「VPS 地址」的拼写（四段都必须在 0–255 之间，不能带端口或用户名）。',
       testFailLocalGui: '本机「客户端端口」上没有 DSH 在监听——网关会把它反代进一个空洞，访客只会看到 502。确认它就是 dsh web 实际监听的端口。',
       testFailKey: '私钥读不到或解析失败：检查「私钥绝对路径」，以及「私钥口令」（口令错也会报成解析失败）。',
@@ -501,7 +508,7 @@ window.__ModuleLoader__.load({
       testing: 'Testing…',
       testDone: 'Connected: authenticated as {host}; the server presented host key {key} (matches the pinned one). You can save now.',
       testFailed: 'The test failed: ',
-      testFailIncomplete: 'The tunnel is incomplete: it needs a VPS address, an SSH user, and a private key path.',
+      testFailIncomplete: 'The configuration is incomplete — the raw line below names the missing item (VPS address, SSH user, key path, public origin, server port, and client port are all required).',
       testFailHost: 'The VPS address cannot be a host: check its spelling (four octets 0–255, no port, no user@).',
       testFailLocalGui: 'Nothing answers like DSH on 客户端端口 (clientPort) — the gateway would proxy into a void and every visitor would see 502. Make sure it is the port dsh web listens on.',
       testFailKey: 'The private key could not be read or parsed: check 私钥绝对路径 and 私钥口令 (a wrong passphrase reads as a parse failure too).',
@@ -921,6 +928,7 @@ window.__ModuleLoader__.load({
             serverPort: Number(valueOf('serverPort')),
             clientPort: Number(valueOf('clientPort')),
             publicOrigin: valueOf('publicOrigin'),
+            sessionTtlHours: Number(valueOf('sessionTtlHours')),
           }
           const enabled = valueOf('tunnel.enabled')
           // "inherit" is not a value: it means the three coordinates decide.

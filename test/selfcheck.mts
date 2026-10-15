@@ -1240,6 +1240,87 @@ await check('a running tunnel is used as the public proof instead of a second bi
   }
 })
 
+await check('a brand-new row can be tested before anything is saved', async () => {
+  // The first save is what this test unlocks, so the test has to work while the row is
+  // still empty. Before this it refused with "no tunnel is configured yet, so there is
+  // nothing to test" — which made a fresh install impossible to configure: the save
+  // gate runs this test *before* the save that would have configured the row, so the
+  // gate could never pass and nothing was ever written.
+  const { private: openSshKey } = ssh2.utils.generateKeyPairSync('ed25519')
+  const keyFile = join(workdir, 'id_ed25519-first-save')
+  await writeFile(keyFile, openSshKey, 'utf8')
+  const serverPort = await serverPortForTest()
+  const gui = await startFakeGui(401)
+  const sshServer = await startSshServer(true)
+  const nginx = await startFakeNginx(serverPort)
+  const home = join(workdir, 'home-first-save')
+  const stateFile = join(home, '.dsh', 'dsh-sync-remote', 'state.json')
+  const { context, effects, routes, release, connect } = harnessContext()
+  const patch = {
+    enabled: true,
+    host: '127.0.0.1',
+    port: sshServer.port,
+    user: 'root',
+    privateKeyFile: keyFile,
+    serverPort,
+    clientPort: gui.port,
+    publicOrigin: `http://127.0.0.1:${String(nginx.port)}`,
+    sessionTtlHours: 24,
+  }
+  /** @param body - the JSON body the page would send. @returns what the route answered. */
+  const callTest = async (body: unknown): Promise<{ status: number, body: Record<string, unknown> }> => {
+    const route = routes.find(candidate => candidate.path === TUNNEL_TEST_PATH)
+    assert.ok(route !== undefined, 'the test route must exist on a row that resolves to nothing')
+    const response = await route.fetch(new Request(`https://dsh.example.test${TUNNEL_TEST_PATH}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }))
+    return { status: response.status, body: await response.json() as Record<string, unknown> }
+  }
+  try {
+    await withEnv({ USERPROFILE: home, HOME: home }, async () => {
+      // Nothing is saved: this is what "新电脑，新装插件" looks like.
+      await apply(context, {})
+      // The connection service arrives in its own microtask, and the settings routes
+      // are registered there — the page's test button needs exactly this.
+      connect()
+
+      const answer = await callTest(patch)
+      assert.equal(answer.status, 200, JSON.stringify(answer.body))
+      assert.equal(answer.body.ok, true, JSON.stringify(answer.body))
+
+      // The fingerprint recorded now must be the one the *saved* row is checked against
+      // at load time — that is the whole reason the first save can proceed. The row shape
+      // here mirrors `candidateRow()`: the enable switch lives inside `tunnel`.
+      const document = JSON.parse(await readFile(stateFile, 'utf8')) as { secret: string, tunnelTests: { fingerprint: string }[] }
+      const asSaved = resolveConfig({
+        publicOrigin: patch.publicOrigin,
+        serverPort: patch.serverPort,
+        clientPort: patch.clientPort,
+        sessionTtlHours: patch.sessionTtlHours,
+        tunnel: { enabled: true, host: patch.host, port: patch.port, user: patch.user, privateKeyFile: patch.privateKeyFile },
+      })
+      assert.equal(document.tunnelTests.length, 1, JSON.stringify(document.tunnelTests))
+      assert.equal(document.tunnelTests[0].fingerprint, tunnelFingerprint(asSaved, document.secret))
+
+      // A half-filled form is named, not refused: on a brand-new install the page has to
+      // be able to say which box is still empty. A failed test is a 409 with a code, not
+      // an `ok: false` success body — the page renders it as a state.
+      const partial = await callTest({ ...patch, publicOrigin: undefined })
+      assert.equal(partial.status, 409, JSON.stringify(partial.body))
+      assert.equal(partial.body.code, 'incomplete', JSON.stringify(partial.body))
+      assert.match(String(partial.body.error), /publicOrigin/u)
+    })
+  } finally {
+    for (const dispose of effects) await dispose()
+    release()
+    await sshServer.close()
+    await gui.close()
+    await nginx.close()
+  }
+})
+
 await check('a refused connection is retried instead of failing the plugin', async () => {
   const keyFile = join(workdir, 'id_ed25519')
   // ssh2's own generator, so the fixture is exactly the OpenSSH format the

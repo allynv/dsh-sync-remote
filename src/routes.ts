@@ -59,6 +59,11 @@ export interface TunnelTestPatch {
   clientPort?: number
   /** The public origin the round trip targets. */
   publicOrigin?: string
+  /**
+   * The session lifetime is not proven by the test, but the candidate has to resolve to
+   * be dialed and the resolver requires it — so the page sends it with everything else.
+   */
+  sessionTtlHours?: number
 }
 
 /** One exact Fetch route, in the shape `ctx.connection.fetch.register` takes. */
@@ -179,7 +184,7 @@ function parseTunnelTestPatch(body: unknown): { patch: TunnelTestPatch } | { err
     }
     patch.passphrase = source.passphrase
   }
-  for (const field of ['serverPort', 'clientPort'] as const) {
+  for (const field of ['serverPort', 'clientPort', 'sessionTtlHours'] as const) {
     const value = source[field]
     if (value === undefined) continue
     if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
