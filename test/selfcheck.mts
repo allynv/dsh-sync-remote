@@ -2083,8 +2083,15 @@ await check('a refused fence closes the tunnel before it ever opens', async () =
       runtime: { gateway: string, tunnel: { state: string, attempts: number, lastError: string | null } | null, fence: { status: number, ok: boolean } | null, launch: { trustedHosts: string[] } | null },
       info: { remoteBind: string | null, sshEquivalent: string | null },
     }
-    // The gateway stays up: it is what serves this page and the local GUI.
-    assert.equal(payload.runtime.gateway, 'listening')
+    // Nothing is bound at all: not the tunnel, and not the gateway listener either —
+    // the deployment serves nothing, so it holds nothing. The settings page that
+    // reports this is DSH's own, on its own port, never this listener's client.
+    assert.equal(payload.runtime.gateway, 'off')
+    assert.equal(
+      await portAccepts('127.0.0.1', freePort, 500),
+      false,
+      'the gateway must not be listening while the fence refuses this Host',
+    )
     assert.equal(payload.runtime.tunnel?.state, 'blocked')
     assert.equal(payload.runtime.tunnel?.attempts, 0, 'a blocked tunnel never dials the VPS')
     assert.match(payload.runtime.tunnel?.lastError ?? '', /--trusted-host/)
@@ -2127,6 +2134,13 @@ await check('an accepting fence still opens the tunnel', async () => {
       `the tunnel must be started once the fence accepts:\n${lines.join('\n')}`,
     )
     assert.equal(printed('the reverse tunnel stays closed'), false, lines.join('\n'))
+    // The other half of the same rule: an accepted fence binds the listener before
+    // the tunnel dials, because the tunnel's only job is to hand connections here.
+    assert.equal(
+      await portAccepts('127.0.0.1', freePort, 1_000),
+      true,
+      'the gateway must be listening once the fence accepts this Host',
+    )
   } finally {
     for (const dispose of effects) await dispose()
     release()

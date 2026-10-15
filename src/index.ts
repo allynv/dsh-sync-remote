@@ -299,6 +299,14 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
   let state: StateDocument | null = null
   let passkeys: PasskeyService | null = null
   let gateway: Gateway | null = null
+  /**
+   * Whether the gateway listener is actually bound.
+   *
+   * Deliberately not "the gateway object exists": the listener waits for the fence
+   * when a tunnel is configured, so the object can stand with nothing behind it —
+   * and the page has to say `off` then, not `listening`.
+   */
+  let gatewayListening = false
   let tunnel: TunnelManager | null = null
   let fence: { authority: string; status: number } | null = null
   /**
@@ -369,13 +377,23 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
       return Promise.all([tunnel?.stop(), gateway?.close(), onEnrollmentChange(null)]).then(() => undefined)
     }, 'dsh-sync-remote: gateway, tunnel, and the one-time link')
 
-    try {
-      await gateway.listen()
-    } catch (error) {
-      statusError = reason(error)
-      log.error(`dsh-sync-remote: the gateway did not start: ${statusError}`)
-      await gateway.close()
-      gateway = null
+    if (resolved.tunnel.enabled) {
+      // The listener waits for the fence, and the reason is the deployment's own
+      // purpose: this gateway exists to hand the tunnel's connections to the GUI, so
+      // with no tunnel there is nothing for it to serve. Its only other customer
+      // would be a loopback browser, and the settings page that reports the refusal
+      // is served by DSH itself (port 3080), never by this listener. Binding nothing
+      // is therefore one fewer thing to find — and one fewer thing to explain.
+    } else {
+      try {
+        await gateway.listen()
+        gatewayListening = true
+      } catch (error) {
+        statusError = reason(error)
+        log.error(`dsh-sync-remote: the gateway did not start: ${statusError}`)
+        await gateway.close()
+        gateway = null
+      }
     }
   }
 
@@ -390,6 +408,47 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
 
     const settings = resolved
     const live = tunnel
+
+    /**
+     * Bind the gateway listener, once.
+     *
+     * Called after the fence accepts and before the tunnel dials: a remote forward
+     * in front of a closed port would be a lie, and the failure to bind is a
+     * deployment fault the page has to report.
+     * @returns whether the listener is up.
+     */
+    const listenGateway = async (): Promise<boolean> => {
+      if (gatewayListening) return true
+      try {
+        await (gateway as Gateway).listen()
+      } catch (error) {
+        statusError = reason(error)
+        log.error(`dsh-sync-remote: the gateway did not start: ${statusError}`)
+        return false
+      }
+      gatewayListening = true
+      return true
+    }
+
+    /**
+     * Announce the enrollment state, minting the first-run link when nobody can get
+     * in yet.
+     *
+     * Called only where there is a public entry to use it from: a link minted while
+     * the fence refuses this Host would be a credential for a door nobody can reach,
+     * and it would expire unused within ten minutes.
+     */
+    const announceEnrollment = async (): Promise<void> => {
+      if (passkeys !== null && passkeys.enrolled) {
+        log.info(`dsh-sync-remote: ${String(state?.passkeys.length ?? 0)} passkey(s) registered; sign in at ${settings.publicOrigin}/signin`)
+        log.info('dsh-sync-remote: to add another device, mint a one-time link in Settings → Remote access')
+        return
+      }
+      // The bootstrap case: nobody can get in yet, so hand the operator a link
+      // without making them open the settings page first.
+      log.warn('dsh-sync-remote: no passkey is registered yet; minting one one-time enrollment link:')
+      await (gateway as Gateway).mintEnrollment()
+    }
 
     /** Ask the fence once, and record the answer the settings page renders. */
     const askFence = async (): Promise<PreflightResult> => {
@@ -442,6 +501,10 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
       }
       if (answer.status === 401) {
         reportFence(answer)
+        // Bind before dialing, and only here: the listener exists for the tunnel's
+        // connections, so a refused fence leaves this process with no listener at
+        // all rather than a loopback door nothing can walk through.
+        if (!await listenGateway()) return
         try {
           await live.start()
         } catch (error) {
@@ -450,6 +513,7 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
           statusError = reason(error)
           log.error(`dsh-sync-remote: the reverse tunnel did not start: ${statusError}`)
         }
+        await announceEnrollment()
         return
       }
       // 403 is the fence answering about the authority; anything else is the GUI
@@ -462,6 +526,11 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
           + '; the reverse tunnel stays closed until its /api answers 401'
       live.block(why)
       log.error(`dsh-sync-remote: the reverse tunnel stays closed: ${why}`)
+      if (passkeys === null || !passkeys.enrolled) {
+        // The bootstrap case, where the difference is worth a line: no link was
+        // minted, and that is deliberate — there is no door a scanner could reach.
+        log.warn('dsh-sync-remote: no enrollment link was minted while the public entry is closed; fix the flag above and restart DSH')
+      }
     }
 
     /**
@@ -480,11 +549,11 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
 
     if (settings.tunnel.enabled) {
       // A wrong `--trusted-host` is the one misconfiguration that produces a live,
-      // authenticated, and completely unusable deployment, so the tunnel waits for
-      // the answer — but only once boot has finished, because `/api` answers 404
-      // until its route owner mounts and that answer describes the moment, not the
-      // deployment (see `onceLoaded`). The gateway stays up meanwhile: it is what
-      // serves the settings page that reports the refusal.
+      // authenticated, and completely unusable deployment, so both the listener and
+      // the tunnel wait for the answer — but only once boot has finished, because
+      // `/api` answers 404 until its route owner mounts and that answer describes the
+      // moment, not the deployment (see `onceLoaded`). Nothing is served meanwhile,
+      // and the page that says so is DSH's settings page on 3080.
       onceLoaded(ctx, () => {
         void startTunnelWhenTrusted().catch((error: unknown) => {
           // Every classified outcome is handled above, so a rejection here is a
@@ -497,6 +566,7 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
       // gets its line before boot finishes. The fence question below is then pure
       // reporting — the settings page still shows what the GUI answers.
       await startTunnel()
+      await announceEnrollment()
       onceLoaded(ctx, () => {
         void askFence().then(reportFence, () => {
           // The probe resolves on every outcome it classifies; a stray rejection
@@ -505,15 +575,6 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
       })
     }
 
-    if (passkeys !== null && passkeys.enrolled) {
-      log.info(`dsh-sync-remote: ${String(state?.passkeys.length ?? 0)} passkey(s) registered; sign in at ${resolved.publicOrigin}/signin`)
-      log.info('dsh-sync-remote: to add another device, mint a one-time link in Settings → Remote access')
-    } else {
-      // The bootstrap case: nobody can get in yet, so hand the operator a link
-      // without making them open the settings page first.
-      log.warn('dsh-sync-remote: no passkey is registered yet; minting one one-time enrollment link:')
-      await gateway.mintEnrollment()
-    }
     if (!resolved.tunnel.enabled) {
       // A deliberate setting, not a fault: the settings page shows the tunnel's
       // state, and an operator who turned it off does not need to be told on
@@ -545,7 +606,9 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
           enrollmentExpiresAt: now === null ? null : now.enrollmentExpiresAt(),
           hostKey: state?.sshHostKey ?? null,
           passkeys: passkeys === null ? [] : passkeys.list(),
-          gatewayListening: now !== null,
+          // The listener's own fact, not the object's existence: a gateway waiting
+          // for the fence is not a running gateway.
+          gatewayListening,
           tunnel: tunnel === null ? null : tunnel.snapshot(),
           fence,
           launch,
@@ -553,6 +616,12 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
       },
       mintEnrollment: async () => {
         if (gateway === null) return { ok: false, reason: 'the gateway is not running; fix the configuration first' }
+        if (!gatewayListening) {
+          // The link is a credential for the public entry, and that entry is closed
+          // until the GUI trusts this Host: minting here would hand out a door key
+          // for a wall, and it would expire unused.
+          return { ok: false, reason: 'the public entry is closed (the GUI does not accept this Host), so an enrollment link could not be reached; fix that first' }
+        }
         const minted = await gateway.mintEnrollment()
         return { url: minted.url, expiresAt: minted.expiresAt }
       },
