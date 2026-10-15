@@ -321,6 +321,7 @@ window.__ModuleLoader__.load({
       blockedDespiteTrust: '具体原因：dsh web 声明信任 "{host}"，但围栏仍然拒绝它——检查拼写、是否多写了端口，或 3080 上跑的是另一个 dsh 进程。',
       blockedNoAnswer: '具体原因：本机 GUI 没有确认它接受该域名（最近一次答复是 HTTP {status}）。',
       blockedUnknown: '具体原因：还没拿到围栏的答复（插件刚启动或探测未完成）；稍等几秒看状态是否刷新。',
+      blockedNoFacts: '具体原因：这次回复里没有 DSH 的启动参数（插件行可能还没重启）。重启 DSH 后再看这一栏，就能知道是没加 --trusted-host，还是加成了别的域名。',
       rawReason: '原始原因（英文，插件原文）：',
       retry: '立即重试',
       retrying: '重试中…',
@@ -434,6 +435,7 @@ window.__ModuleLoader__.load({
       blockedDespiteTrust: 'Specifically: dsh web declares it trusts "{host}", yet the fence still refuses it \u2014 check the spelling, any extra port, or whether another dsh process answers on 3080.',
       blockedNoAnswer: 'Specifically: the local GUI has not confirmed it accepts this Host (its last answer was HTTP {status}).',
       blockedUnknown: 'Specifically: no fence answer has arrived yet (the plugin just started or the probe is still running); watch the state line for a few seconds.',
+      blockedNoFacts: 'Specifically: this answer carried no dsh web launch facts (the plugin row may not have restarted yet). Restart DSH and this line will say whether --trusted-host was missing or named a different host.',
       rawReason: 'Raw reason (English, from the plugin):',
       retry: 'Retry now',
       retrying: 'Retrying\u2026',
@@ -835,8 +837,13 @@ window.__ModuleLoader__.load({
           const published = typeof live.effective.publicOrigin === 'string' ? hostOf(live.effective.publicOrigin) : null
           const authority = published ?? fence.authority
           if (fence.status !== 403) return t('blockedNoAnswer').replace('{status}', String(fence.status))
-          const trusted = live.runtime.launch?.trustedHosts ?? null
-          if (trusted === null || trusted.length === 0) return t('blockedNoFlag').replace('{host}', authority)
+          // The launch facts arrive with a Host half that knows about them; a page
+          // reloaded ahead of the row must not turn "not reported" into "you passed
+          // no flag", which would send the operator to fix the wrong thing.
+          const launch = live.runtime.launch
+          if (launch === null || launch === undefined) return t('blockedNoFacts')
+          const trusted = launch.trustedHosts
+          if (trusted.length === 0) return t('blockedNoFlag').replace('{host}', authority)
           if (trusted.some(entry => entry.toLowerCase() === authority.toLowerCase())) {
             return t('blockedDespiteTrust').replace('{host}', authority)
           }

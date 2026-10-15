@@ -656,6 +656,14 @@ await check('a blocked tunnel explains itself in Chinese, from the facts, not th
   await settle()
   assert.match(renderedText(render()), /最近一次答复是 HTTP 404/)
 
+  // (d) A page reloaded ahead of the Host half: no launch facts at all. Claiming
+  // "you passed no flag" here would send the operator to fix the wrong thing.
+  withRuntime({ tunnel: blocked, fence: { authority: 'dsh.example.test', status: 403, ok: false }, launch: null })
+  await settle()
+  text = renderedText(render())
+  assert.match(text, /没有 DSH 的启动参数/)
+  assert.equal(/没有\*\*加 --trusted-host/u.test(text), false, `without the facts, the page must not assert the flag was missing:\n${text}`)
+
   statusPayload = saved
   button(render(), '刷新状态').props.onClick()
   await settle()
