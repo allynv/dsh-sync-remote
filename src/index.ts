@@ -18,6 +18,14 @@
  * `dsh web` started without `--trusted-host` publishes nothing at all instead of
  * a login page in front of an `/api` that answers 403.
  *
+ * A second gate is about the values rather than the GUI: the settings page must
+ * pass a connection test before it may write the tunnel's connection fields, and
+ * the saved values carry a fingerprint into the state file. The running plugin
+ * dials only a configuration whose fingerprint a test has recorded, so a value
+ * edited into the profile by hand — or one tested and then never saved — leaves
+ * the row in `untested` with no listener and no remote forward, one click away
+ * from being proven.
+ *
  * The plugin needs no Host service to serve. The one it optionally uses is
  * `connection`, and only for two things: putting the settings page's routes
  * behind DSH's own browser-trust fence and operator session, and building the
@@ -40,9 +48,10 @@
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import { describeConfig, plainRow, provenance, resolveConfig, type Provenance, type ResolvedConfig, type ResolvedTarget, type RowConfig } from './config.ts'
+import { describeConfig, plainRow, provenance, resolveConfig, tunnelFingerprint, type Provenance, type ResolvedConfig, type ResolvedTarget, type RowConfig } from './config.ts'
 import { Gateway, type PreflightResult } from './gateway.ts'
-import { registerRoutes, type RouteRegistry, type RouteSource } from './routes.ts'
+import { probeTunnel } from './probe.ts'
+import { registerRoutes, type RouteRegistry, type RouteSource, type TunnelTestPatch } from './routes.ts'
 import { StateStore } from './state.ts'
 import { buildStatus, sshEquivalent } from './status.ts'
 import { TunnelManager } from './tunnel.ts'
@@ -318,6 +327,14 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
    * skipped the check would be a way to expose a GUI that refuses to serve.
    */
   let startTunnel: (() => Promise<void>) | null = null
+  /**
+   * Whether a connection test is in flight.
+   *
+   * One dial per click is enough: a second test started while the first is still
+   * waiting out its ready timeout would only repeat the same answer and burn an
+   * SSH session on the VPS.
+   */
+  let probingTunnel = false
   /** Builds DSH's tokenized entry URL once the `connection` service is mounted. */
   let dshEntryFor: ((path: string) => string) | null = null
   const enrollFile = resolved === null ? null : join(dirname(resolved.stateFile), ENROLL_FILE)
@@ -378,12 +395,14 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
     }, 'dsh-sync-remote: gateway, tunnel, and the one-time link')
 
     if (resolved.tunnel.enabled) {
-      // The listener waits for the fence, and the reason is the deployment's own
+      // The listener waits for the tunnel, and the reason is the deployment's own
       // purpose: this gateway exists to hand the tunnel's connections to the GUI, so
       // with no tunnel there is nothing for it to serve. Its only other customer
       // would be a loopback browser, and the settings page that reports the refusal
       // is served by DSH itself (port 3080), never by this listener. Binding nothing
-      // is therefore one fewer thing to find — and one fewer thing to explain.
+      // is therefore one fewer thing to find — and one fewer thing to explain: an
+      // unverified configuration, a refused fence, a rejected key and a refused
+      // authentication all end with no listener at all.
     } else {
       try {
         await gateway.listen()
@@ -398,11 +417,18 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
   }
 
   if (resolved !== null && gateway !== null && statusError === null) {
+    // What a connection test has to have proven before this row may dial: the
+    // address, the port, the user, the key file, and its passphrase, together.
+    const fingerprint = tunnelFingerprint(resolved, (store as StateStore).state.secret)
     tunnel = new TunnelManager({
       config: resolved,
+      fingerprint,
       local: { host: resolved.loopbackHost, port: resolved.serverPort },
       store: store as StateStore,
       log,
+      // Late-bound for the same reason `dshEntry` is: the listener is defined
+      // below, and this callback only ever runs after an SSH session is ready.
+      ensureLocal: () => listenGateway(),
     })
     gateway.tunnel = tunnel
 
@@ -412,22 +438,25 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
     /**
      * Bind the gateway listener, once.
      *
-     * Called after the fence accepts and before the tunnel dials: a remote forward
-     * in front of a closed port would be a lie, and the failure to bind is a
-     * deployment fault the page has to report.
-     * @returns whether the listener is up.
+     * Called from the tunnel, after an SSH session has authenticated and
+     * immediately before the remote forward is requested: a forward in front of a
+     * closed port would be a lie, and a listener that exists while the SSH
+     * connection is still failing would make the settings page report a healthy
+     * gateway in front of a dead tunnel. The failure to bind is a deployment
+     * fault the page has to report, and the tunnel stops on it.
+     * @returns whether the listener is up, or why it is not.
      */
-    const listenGateway = async (): Promise<boolean> => {
-      if (gatewayListening) return true
+    const listenGateway = async (): Promise<{ ok: true } | { ok: false; message: string }> => {
+      if (gatewayListening) return { ok: true }
       try {
         await (gateway as Gateway).listen()
       } catch (error) {
         statusError = reason(error)
         log.error(`dsh-sync-remote: the gateway did not start: ${statusError}`)
-        return false
+        return { ok: false, message: statusError }
       }
       gatewayListening = true
-      return true
+      return { ok: true }
     }
 
     /**
@@ -487,6 +516,11 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
      * reachable by anyone who finds the port. Requesting no remote forward is
      * the only answer that leaves nothing to find.
      *
+     * A second precondition waits inside `TunnelManager.start()`: the row only
+     * dials a configuration a connection test has proven. Both refusals are
+     * states with no listener and no SSH session; this one is checked first,
+     * because a fence refusal cannot be repaired from this plugin's page at all.
+     *
      * The condition is a `dsh web` launch parameter, so it cannot change while
      * this row is loaded — there is nothing to poll for. Every path that opens
      * the tunnel runs this same check, which is why `startTunnel` is the only
@@ -501,10 +535,6 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
       }
       if (answer.status === 401) {
         reportFence(answer)
-        // Bind before dialing, and only here: the listener exists for the tunnel's
-        // connections, so a refused fence leaves this process with no listener at
-        // all rather than a loopback door nothing can walk through.
-        if (!await listenGateway()) return
         try {
           await live.start()
         } catch (error) {
@@ -513,7 +543,11 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
           statusError = reason(error)
           log.error(`dsh-sync-remote: the reverse tunnel did not start: ${statusError}`)
         }
-        await announceEnrollment()
+        // An unverified configuration opens no public entry, so it gets no
+        // enrollment link either: the link would be a credential for a door
+        // nobody can reach, and it expires unused within ten minutes. The page's
+        // 「测试连接」 is what lifts that state.
+        if (live.snapshot().state !== 'untested') await announceEnrollment()
         return
       }
       // 403 is the fence answering about the authority; anything else is the GUI
@@ -591,6 +625,29 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
   // service, including while the gateway is down: that page is what reports
   // *why* it is down, so it must not depend on the gateway existing.
   if (ctx.inject !== undefined) {
+    /**
+     * The row as it would be with the form's draft tunnel values applied.
+     *
+     * Everything the form did not send keeps its stored value — including the
+     * passphrase, which the browser is never shown (`null` is the form saying
+     * "this row has none", which is how clearing it is tested).
+     * @param patch - the draft fields the connection test carries.
+     * @returns the candidate row config.
+     */
+    const candidateRow = (patch: TunnelTestPatch): RowConfig => {
+      const base = plainRow(config ?? {})
+      const current = typeof base.tunnel === 'object' && base.tunnel !== null ? base.tunnel as RowConfig : {}
+      const tunnelRow: RowConfig = { ...current }
+      if (patch.enabled !== undefined) tunnelRow.enabled = patch.enabled
+      if (patch.host !== undefined) tunnelRow.host = patch.host
+      if (patch.port !== undefined) tunnelRow.port = patch.port
+      if (patch.user !== undefined) tunnelRow.user = patch.user
+      if (patch.privateKeyFile !== undefined) tunnelRow.privateKeyFile = patch.privateKeyFile
+      if (patch.passphrase === null) delete tunnelRow.passphrase
+      else if (patch.passphrase !== undefined) tunnelRow.passphrase = patch.passphrase
+      return { ...base, tunnel: tunnelRow }
+    }
+
     const source: RouteSource = {
       status: () => {
         const now = gateway
@@ -618,9 +675,15 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
         if (gateway === null) return { ok: false, reason: 'the gateway is not running; fix the configuration first' }
         if (!gatewayListening) {
           // The link is a credential for the public entry, and that entry is closed
-          // until the GUI trusts this Host: minting here would hand out a door key
+          // until the tunnel is actually up: minting here would hand out a door key
           // for a wall, and it would expire unused.
-          return { ok: false, reason: 'the public entry is closed (the GUI does not accept this Host), so an enrollment link could not be reached; fix that first' }
+          const tunnelState = tunnel?.snapshot().state
+          return {
+            ok: false,
+            reason: tunnelState === 'untested'
+              ? 'this tunnel configuration has not been verified yet, so the public entry is closed; run the connection test first'
+              : 'the public entry is closed (the tunnel is not up), so an enrollment link could not be reached; fix the tunnel first',
+          }
         }
         const minted = await gateway.mintEnrollment()
         return { url: minted.url, expiresAt: minted.expiresAt }
@@ -659,10 +722,56 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
         if (after.state === 'blocked') {
           return { ok: false, reason: after.lastError ?? 'the GUI refuses this authority, so no tunnel was opened' }
         }
+        if (after.state === 'untested') {
+          // Retrying cannot help here: the values themselves are unproven, and
+          // only a connection test can change that.
+          return { ok: false, reason: 'this configuration has not been verified yet; run 「测试连接」 first' }
+        }
         if (after.state === 'failed') {
           return { ok: false, reason: after.lastError ?? 'the tunnel refused to start' }
         }
         return { ok: true }
+      },
+      testTunnel: async (patch) => {
+        if (resolved === null || store === null || state === null) {
+          return { ok: false, reason: 'no tunnel is configured yet, so there is nothing to test' }
+        }
+        if (probingTunnel) {
+          return { ok: false, reason: 'a connection test is already running' }
+        }
+        // The candidate goes through the same resolver the running row does, so
+        // the fingerprint recorded here is exactly the one `apply()` computes for
+        // the saved values — and a value the resolver refuses is named now rather
+        // than surfacing later as a tunnel that cannot start.
+        let candidate: ResolvedConfig
+        try {
+          candidate = resolveConfig(candidateRow(patch))
+        } catch (error) {
+          return { ok: false, reason: reason(error) }
+        }
+        if (!candidate.tunnel.enabled) {
+          return { ok: false, reason: 'the tunnel is switched off, so there is nothing to test' }
+        }
+        probingTunnel = true
+        try {
+          const result = await probeTunnel({ config: candidate.tunnel, pin: state.sshHostKey, log })
+          if (!result.ok) {
+            return { ok: false, reason: result.reason ?? 'the connection test failed' }
+          }
+          const tested = tunnelFingerprint(candidate, state.secret)
+          await store.rememberTunnelTest(tested, result.hostKey)
+          // Testing the values that are already running is how an unverified
+          // deployment comes back without a save and a row reload.
+          let restarted = false
+          if (tunnel !== null && startTunnel !== null && tested === tunnelFingerprint(resolved, state.secret)) {
+            await tunnel.stop()
+            await startTunnel()
+            restarted = true
+          }
+          return { ok: true, hostKey: result.hostKey, verifiedAt: Date.now(), restarted }
+        } finally {
+          probingTunnel = false
+        }
       },
       releaseStaleForward: async () => {
         if (tunnel === null) {

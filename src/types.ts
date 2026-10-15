@@ -52,6 +52,16 @@ export interface PasskeySummary {
   backedUp: boolean | null
 }
 
+/** One tunnel configuration a connection test has proven. */
+export interface TunnelTestRecord {
+  /** Identity of the configuration; see `tunnelFingerprint`. */
+  fingerprint: string
+  /** Epoch milliseconds of the successful test. */
+  at: number
+  /** The host key the server presented then, for display only. */
+  hostKey: string | null
+}
+
 /** The whole durable state document. */
 export interface StateDocument {
   version: number
@@ -71,4 +81,16 @@ export interface StateDocument {
   /** Trusted SSH host key: `SHA256:<base64>` after the first connection. */
   sshHostKey: string | null
   passkeys: PasskeyRecord[]
+  /**
+   * Tunnel configurations a connection test has proven, newest first.
+   *
+   * A configuration missing from this list is never dialed: the values may have
+   * been edited in the profile by hand, and the only thing that makes them
+   * trustworthy is a test that reached the VPS with exactly those values. A
+   * short list rather than one entry, because testing new values and then not
+   * saving (or having the save refused) must not un-verify the configuration
+   * that is actually running. Added after the first releases; an older file
+   * simply has none.
+   */
+  tunnelTests: TunnelTestRecord[]
 }

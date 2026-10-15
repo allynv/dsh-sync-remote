@@ -195,6 +195,23 @@ interface Minted {
 }
 
 /**
+ * The tunnel values a connection test carries.
+ *
+ * Every field is optional: what the form cannot see is left out and the Host
+ * merges the stored value in. `passphrase` may be `null`, which is how "this row
+ * has none" is said out loud for the one case that needs it (clearing a
+ * passphrase that used to be set).
+ */
+interface CandidatePatch {
+  enabled?: boolean
+  host?: string
+  port?: number
+  user?: string
+  privateKeyFile?: string
+  passphrase?: string | null
+}
+
+/**
  * One editable field.
  */
 interface FieldDef {
@@ -285,6 +302,7 @@ window.__ModuleLoader__.load({
     const REMOVE_PATH = '/api/sync-remote.passkey.remove'
     const FORGET_PATH = '/api/sync-remote.trust.forget'
     const RETRY_PATH = '/api/sync-remote.tunnel.retry'
+    const TEST_PATH = '/api/sync-remote.tunnel.test'
     const RELEASE_PATH = '/api/sync-remote.tunnel.release'
 
     const zh = {
@@ -328,7 +346,17 @@ window.__ModuleLoader__.load({
       retryStarted: '已重新发起连接；状态稍后自动刷新。',
       retryFailed: '重试没有成功：',
       nextRetry: '下次重试',
-      suspectedConfig: '连续多次失败、而且一次都没成功过：请重点检查「VPS 地址」与「VPS 的 SSH 端口」。退避已放慢到 5 分钟，改完保存或点「立即重试」。',
+      test: '测试连接',
+      testing: '测试中…',
+      testDone: '连接成功：已认证 {host}；服务器出示的主机密钥 {key}（与已固定一致）。现在可以保存。',
+      testFailed: '测试失败：',
+      testNeedsSave: '隧道设置改了：先测试连接，成功了才会保存。',
+      retriesStopped: '不会自动重试：修好之后保存，或点「立即重试」；若提示主机密钥不符，请点「重新信任」。',
+      untested: 'untested（配置未验证）',
+      untestedTitle: '本次配置还没有验证过，公网入口不会打开。',
+      untestedHint: '点「测试连接」；成功后保存即可。手工改过配置文件也会回到这个状态。',
+      hintLocal: '本机网关端口没能绑定（多半被别的进程占用）：改「服务端端口」，或先释放占用它的进程，然后点「立即重试」。',
+      suspectedConfig: '连续多次没连上。这组配置是验证过的，所以更可能是 VPS 或网络暂时不可用；会继续按最长 5 分钟间隔重连。若你改过地址、端口或密钥，请先「测试连接」。',
       hintKey: '私钥读不到或格式不支持：改「私钥绝对路径」，或重新生成一把（只支持 OpenSSH、PKCS#1、SEC1、PuTTY PPK）。',
       hintAuth: 'SSH 认证被拒：检查「SSH 用户」、私钥是否与该用户配对、以及私钥口令。',
       hintHostKey: 'VPS 的主机密钥和已固定的不一致：确认这是你重装/换机后的 VPS，再点下面「重新信任」。',
@@ -397,7 +425,10 @@ window.__ModuleLoader__.load({
       errRange: '超出允许范围',
       errOrigin: '需要是完整 origin，例如 https://dsh.example.com（不带路径）',
       errPath: '需要绝对路径',
-      errHost: '只能包含字母、数字、点和连字符',
+      errHost: '只能包含字母、数字、点、下划线和连字符',
+      errHostBracket: 'IPv6 地址不要加方括号：直接写 ::1',
+      errHostIp: 'IP 地址无效：四段都必须在 0–255 之间',
+      errHostPort: '这看起来是「地址:端口」；端口请填到「VPS 的 SSH 端口」',
       errRequired: '必填（这个值无法猜，必须与 VPS / Nginx 一致）',
     }
 
@@ -442,7 +473,17 @@ window.__ModuleLoader__.load({
       retryStarted: 'A new connection attempt was started; the state refreshes on its own.',
       retryFailed: 'The retry did not succeed:',
       nextRetry: 'next retry',
-      suspectedConfig: 'Repeated failures and not one success yet: check "VPS address" and "VPS SSH port" first. The backoff has slowed to five minutes \u2014 save a fix or press Retry now.',
+      test: 'Test connection',
+      testing: 'Testing…',
+      testDone: 'Connected: authenticated as {host}; the server presented host key {key} (matches the pinned one). You can save now.',
+      testFailed: 'The test failed: ',
+      testNeedsSave: 'The tunnel settings changed: they are tested first, and only saved when the test passes.',
+      retriesStopped: 'It will not retry on its own: fix it and save, or press Retry now; if the host key does not match, press Trust again.',
+      untested: 'untested (configuration not verified)',
+      untestedTitle: 'This configuration has not been verified, so the public entry stays closed.',
+      untestedHint: 'Press “Test connection”; save once it passes. Editing the configuration file by hand leads back here.',
+      hintLocal: 'The local gateway port could not be bound (something else usually holds it): change “Server port”, or free it, then press Retry now.',
+      suspectedConfig: 'Repeated failures. This configuration was verified by a connection test, so the VPS or the network is the likelier cause; it keeps reconnecting at up to five-minute intervals. If you changed the address, port, or key, run the connection test first.',
       hintKey: 'The private key cannot be read or is in a format ssh2 rejects: fix "absolute path to the private key", or generate a new one (OpenSSH, PKCS#1, SEC1, or PuTTY PPK only).',
       hintAuth: 'SSH authentication was rejected: check the SSH user, that the key belongs to that user, and the key\u2019s passphrase.',
       hintHostKey: 'The server\u2019s host key does not match the pinned one: once you are sure this is your VPS after a reinstall, press Trust again below.',
@@ -511,7 +552,10 @@ window.__ModuleLoader__.load({
       errRange: 'out of range',
       errOrigin: 'needs a full origin, for example https://dsh.example.com (no path)',
       errPath: 'needs an absolute path',
-      errHost: 'letters, digits, dots, and hyphens only',
+      errHost: 'letters, digits, dots, underscores, and hyphens only',
+      errHostBracket: 'write an IPv6 address without brackets: ::1, not [::1]',
+      errHostIp: 'not a valid IPv4 address: all four parts must be 0–255',
+      errHostPort: 'that looks like host:port — put the port in “VPS SSH port”',
       errRequired: 'required — this value cannot be guessed, it must match the VPS and Nginx',
     }
 
@@ -544,6 +588,21 @@ window.__ModuleLoader__.load({
     /** Every field, keyed by its dotted path. */
     const FIELDS = new Map<string, FieldDef>()
     for (const group of GROUPS) for (const field of group.fields) FIELDS.set(field.path, field)
+
+    /**
+     * The form paths whose value a connection test has to prove before a write.
+     *
+     * Exactly what `tunnelFingerprint` covers: those are the values a dial
+     * exercises, so those are the ones that may not be persisted untested.
+     * `serverPort`, `clientPort` and the public origin stay outside both — a dial
+     * proves nothing about them, and demanding a test for them would only add a
+     * click. The enable switch is outside too: flipping it cannot invalidate a
+     * proof, and turning it on with unproven values is what the Host's own
+     * `untested` gate is for.
+     */
+    const GATED_PATHS = new Set([
+      'tunnel.host', 'tunnel.port', 'tunnel.user', 'tunnel.privateKeyFile', 'tunnel.passphrase',
+    ])
 
     const CSS = `
 .dsh-sync-remote { display: flex; flex-direction: column; gap: 18px; max-width: 760px; color: var(--dsw-alias-label-primary); }
@@ -651,7 +710,17 @@ window.__ModuleLoader__.load({
         return null
       }
       if (field.path === 'tunnel.host') {
-        return /^[a-z0-9.:-]+$/iu.test(text) ? null : t('errHost')
+        if (!/^[a-z0-9._:-]+$/iu.test(text)) return t('errHost')
+        // The two typos that are decided without any network at all are caught
+        // here too, mirroring `tunnelHostProblem` on the Host half; everything
+        // else about the address is the connection test's verdict, not this
+        // page's guess.
+        if (text.startsWith('[') || text.endsWith(']')) return t('errHostBracket')
+        if (/^(\d{1,3}\.){3}\d{1,3}$/u.test(text) && text.split('.').some(part => Number(part) > 255)) {
+          return t('errHostIp')
+        }
+        if (/^[^:]+:\d{1,5}$/u.test(text)) return t('errHostPort')
+        return null
       }
       if (field.path === 'tunnel.privateKeyFile') {
         return /^([a-zA-Z]:[\\/]|\/)/u.test(text) ? null : t('errPath')
@@ -677,6 +746,15 @@ window.__ModuleLoader__.load({
         const [minted, setMinted] = React.useState<Minted | null>(null)
         const [autoMinted, setAutoMinted] = React.useState(false)
         const [showTunnel, setShowTunnel] = React.useState(true)
+        /**
+         * The candidate values the last successful connection test proved.
+         *
+         * Serialized, so it is a plain equality check against the current draft:
+         * any edit after a test invalidates it, and the save gate then insists on
+         * a fresh one. This is the page half of "test, then persist"; the state
+         * file's fingerprint is the Host half.
+         */
+        const [testedDraft, setTestedDraft] = React.useState<string | null>(null)
         /** Which masked fields the operator chose to reveal, by form path. */
         const [revealed, setRevealed] = React.useState<Record<string, boolean>>({})
         /** Re-rendered on a timer so the minted link's remaining life counts down. */
@@ -778,6 +856,108 @@ window.__ModuleLoader__.load({
         }
 
         /**
+         * The values a connection test should carry, as the form sees them.
+         *
+         * `valueOf` resolves the draft, then the row, then the effective value —
+         * exactly what the pending save would write — so the tested candidate and
+         * the saved configuration are the same values. The passphrase is the one
+         * secret the page is never shown: it is sent only when the operator typed
+         * one, and explicitly `null` when a field is being reset.
+         * @param overrides - values a reset is about to remove.
+         * @returns the patch for the Host's test route.
+         */
+        const collectCandidate = function (overrides?: { passphrase?: string | null }): CandidatePatch {
+          const patch: CandidatePatch = {
+            host: valueOf('tunnel.host'),
+            port: Number(valueOf('tunnel.port')),
+            user: valueOf('tunnel.user'),
+            privateKeyFile: valueOf('tunnel.privateKeyFile'),
+          }
+          const enabled = valueOf('tunnel.enabled')
+          // "inherit" is not a value: it means the three coordinates decide.
+          if (enabled === 'true') patch.enabled = true
+          else if (enabled === 'false') patch.enabled = false
+          const passphrase = overrides !== undefined && 'passphrase' in overrides
+            ? overrides.passphrase
+            : draft['tunnel.passphrase']
+          if (typeof passphrase === 'string' && passphrase !== '') patch.passphrase = passphrase
+          else if (passphrase === null) patch.passphrase = null
+          return patch
+        }
+
+        /** @returns whether the values on screen would enable the tunnel. */
+        const tunnelWillBeEnabled = function (): boolean {
+          return valueOf('tunnel.enabled') !== 'false'
+            && valueOf('tunnel.host') !== ''
+            && valueOf('tunnel.user') !== ''
+            && valueOf('tunnel.privateKeyFile') !== ''
+        }
+
+        /**
+         * Dial the candidate once, on the Host, and report what came back.
+         *
+         * Nothing is written here: recording the fingerprint is the Host's job,
+         * and it does that only when the dial actually authenticated.
+         * @param candidate - the values to prove.
+         * @returns whether the test passed.
+         */
+        const runTest = function (candidate: CandidatePatch): Promise<boolean> {
+          setMessage(t('testing'))
+          return fetch(TEST_PATH, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(candidate),
+          })
+            .then(async (response) => {
+              const payload = (await response.json().catch(() => null)) as { ok?: boolean, hostKey?: unknown, error?: unknown } | null
+              if (!response.ok || payload === null || payload.ok !== true) {
+                throw new Error(payload && payload.error ? String(payload.error) : 'HTTP ' + String(response.status))
+              }
+              setMessage(t('testDone')
+                .replace('{host}', String(candidate.user ?? '') + '@' + String(candidate.host ?? ''))
+                .replace('{key}', typeof payload.hostKey === 'string' ? payload.hostKey : '—'))
+              return true
+            })
+            .catch((error: unknown) => {
+              setMessage(t('testFailed') + ' ' + (error instanceof Error ? error.message : String(error)))
+              return false
+            })
+        }
+
+        /** Prove the values currently on screen, because the operator asked. */
+        const testNow = function (): void {
+          const candidate = collectCandidate()
+          setBusy(true)
+          void runTest(candidate)
+            .then(async (ok) => {
+              if (ok) {
+                setTestedDraft(JSON.stringify(candidate))
+                await refresh()
+              }
+              setBusy(false)
+            })
+        }
+
+        /**
+         * Run the gate before a write that touches the tunnel.
+         *
+         * A configuration is allowed to persist only once a dial with exactly
+         * those values has authenticated: the Host cannot check that later (it
+         * only sees values), and a value that cannot connect is worth catching
+         * here rather than as a tunnel that sits in `untested` afterwards.
+         * @param candidate - the values the pending write would leave behind.
+         * @returns whether the write may proceed.
+         */
+        const ensureTested = function (candidate: CandidatePatch): Promise<boolean> {
+          if (testedDraft === JSON.stringify(candidate)) return Promise.resolve(true)
+          setMessage(t('testNeedsSave'))
+          return runTest(candidate).then((ok) => {
+            if (ok) setTestedDraft(JSON.stringify(candidate))
+            return ok
+          })
+        }
+
+        /**
          * Whether this page may write the row's configuration.
          *
          * Three facts that actually exist: the Host document accepts writes, the
@@ -812,6 +992,7 @@ window.__ModuleLoader__.load({
             case 'auth': return t('hintAuth')
             case 'host-key': return t('hintHostKey')
             case 'forward-refused': return t('hintForward')
+            case 'local': return t('hintLocal')
             case 'dns':
             case 'unreachable':
             case 'handshake-timeout': return t('hintConfig')
@@ -868,6 +1049,23 @@ window.__ModuleLoader__.load({
           return found
         }
 
+        /**
+         * Write the pending operations through the Host's form.
+         *
+         * Called directly for a write the gate does not cover, so the common case
+         * keeps the behaviour it always had: one `mutate`, no extra round trip.
+         * @param ops - the operations to write.
+         * @returns the write and its refresh.
+         */
+        const applyOps = function (ops: PathOp[]): Promise<void> {
+          return form.mutate(ops)
+            .then((accepted) => {
+              setDraft({})
+              setMessage(accepted ? t('saved') : t('saveFailed'))
+              return refresh()
+            })
+        }
+
         const save = function (): void {
           const invalid = problems()
           const failed = Object.keys(invalid)
@@ -903,15 +1101,22 @@ window.__ModuleLoader__.load({
             setMessage(t('saved'))
             return
           }
+          const touched = ops.map(op => op.path.join('.'))
+          // Only a write that leaves the tunnel enabled with values it cannot
+          // have proven needs the gate: a save that turns the tunnel off, or one
+          // that edits the public origin, has nothing to dial.
+          const needed = touched.some(path => GATED_PATHS.has(path)) && tunnelWillBeEnabled()
           setBusy(true)
           setMessage(null)
-          form.mutate(ops)
-            .then((accepted) => {
-              setDraft({})
-              setMessage(accepted ? t('saved') : t('saveFailed'))
-              return refresh()
-            })
-            .catch((error: unknown) => { setMessage((error instanceof Error ? error.message : String(error))) })
+          if (!needed) {
+            void applyOps(ops)
+              .catch((error: unknown) => { setMessage(error instanceof Error ? error.message : String(error)) })
+              .then(() => { setBusy(false) })
+            return
+          }
+          void ensureTested(collectCandidate())
+            .then((ok) => ok ? applyOps(ops) : undefined)
+            .catch((error: unknown) => { setMessage(error instanceof Error ? error.message : String(error)) })
             .then(() => { setBusy(false) })
         }
 
@@ -923,9 +1128,22 @@ window.__ModuleLoader__.load({
             return next
           })
           if (!isOwn(path)) return
+          const ops: PathOp[] = [{ op: 'unset', path: path.split('.') }]
+          /** @returns the clearing write and its refresh. */
+          const applyReset = (): Promise<void> =>
+            form.mutate(ops).then(() => { setMessage(t('saved')); return refresh() })
           setBusy(true)
-          form.mutate([{ op: 'unset', path: path.split('.') }])
-            .then(() => { setMessage(t('saved')); return refresh() })
+          // Clearing a passphrase changes the configuration just as much as
+          // typing one, and the page cannot test it implicitly — the Host has to
+          // be told "this row has none" out loud, so the candidate carries `null`.
+          if (path !== 'tunnel.passphrase' || !tunnelWillBeEnabled()) {
+            void applyReset()
+              .catch((error: unknown) => { setMessage(error instanceof Error ? error.message : String(error)) })
+              .then(() => { setBusy(false) })
+            return
+          }
+          void ensureTested(collectCandidate({ passphrase: null }))
+            .then((ok) => ok ? applyReset() : undefined)
             .catch((error: unknown) => { setMessage(error instanceof Error ? error.message : String(error)) })
             .then(() => { setBusy(false) })
         }
@@ -1120,13 +1338,14 @@ window.__ModuleLoader__.load({
           // later is read defensively: an older payload must render as "not there",
           // never as `(undefined)` or `下次重试 NaNs`.
           const kind = typeof tunnel.kind === 'string' && tunnel.kind !== '' ? ' (' + tunnel.kind + ')' : ''
+          const stateText = tunnel.state === 'untested' ? t('untested') : tunnel.state + kind
           const retryAt = typeof tunnel.nextRetryAt === 'number' && Number.isFinite(tunnel.nextRetryAt) ? tunnel.nextRetryAt : null
           const countdown = retryAt === null
             ? ''
             : ' · ' + t('nextRetry') + ' ' + String(Math.max(0, Math.round((retryAt - Date.now()) / 1000))) + 's'
           facts.push(h('div', { className: 'sr-fact', key: 'tn' }, [
             h('span', { className: 'sr-dot' + (tunnel.state === 'listening' ? ' ok' : ' bad') }),
-            h('span', null, t('tunnel') + ': ' + tunnel.state + kind
+            h('span', null, t('tunnel') + ': ' + stateText
               + (tunnel.remote === null ? '' : ' → ' + tunnel.remote)
               + ' · ' + String(tunnel.attempts) + '×'
               + countdown),
@@ -1191,6 +1410,16 @@ window.__ModuleLoader__.load({
             h('div', { className: 'sr-hint' }, blockedExplanation(status)),
             h('div', { className: 'sr-hint' }, t('tunnelBlockedHint')),
           ]))
+        } else if (status !== null && status.runtime.tunnel !== null && status.runtime.tunnel.state === 'untested') {
+          // Not a failure: the values may be perfect, nobody has shown it yet.
+          // The banner therefore carries the way out rather than ssh2's wording.
+          banners.push(h('div', { className: 'sr-banner error', key: 'untested' }, [
+            h('div', null, t('untestedTitle')),
+            h('div', { className: 'sr-hint' }, t('untestedHint')),
+            h('div', { className: 'sr-actions' }, [
+              h('button', { className: 'sr-btn', type: 'button', disabled: busy, onClick: testNow }, busy ? t('testing') : t('test')),
+            ]),
+          ]))
         } else if (status !== null && status.runtime.tunnel !== null && status.runtime.tunnel.state !== 'listening'
           && status.runtime.tunnel.lastError !== null) {
           const tunnel = status.runtime.tunnel
@@ -1204,6 +1433,7 @@ window.__ModuleLoader__.load({
             // fix instead of handing over ssh2's wording and letting the operator
             // guess which of six values is wrong.
             h('div', { className: 'sr-hint' }, hintFor(tunnel)),
+            tunnel.state === 'failed' ? h('div', { className: 'sr-hint' }, t('retriesStopped')) : null,
             tunnel.suspected === 'configuration' ? h('div', { className: 'sr-hint' }, t('suspectedConfig')) : null,
             h('div', { className: 'sr-actions' }, [
               h('button', { className: 'sr-btn', type: 'button', disabled: busy, onClick: retryTunnel }, busy ? t('retrying') : t('retry')),
@@ -1341,6 +1571,9 @@ window.__ModuleLoader__.load({
             h('h2', null, t('title')),
             h('div', { className: 'sr-actions' }, [
               h('button', { className: 'sr-btn', type: 'button', onClick: () => { void refresh() } }, t('refresh')),
+              // Dialing costs nothing and writes no configuration, so this one
+              // control is not gated on the page being the editable, loopback one.
+              h('button', { className: 'sr-btn', type: 'button', disabled: busy, onClick: testNow }, busy ? t('testing') : t('test')),
               h('button', { className: 'sr-btn primary', type: 'button', disabled: busy || !writable, onClick: save }, busy ? t('saving') : t('save')),
             ]),
           ]),

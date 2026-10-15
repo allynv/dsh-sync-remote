@@ -93,10 +93,12 @@ export interface SyncRemoteStatus {
   runtime: {
     gateway: 'listening' | 'off'
     /**
-     * The tunnel's state, including `blocked`: the gateway is up and the tunnel
-     * is deliberately not started because the local GUI's browser-trust fence
-     * refuses the authority browsers use. That is a served-nothing state, not a
-     * transient one — only loading the plugin row again can change it.
+     * The tunnel's state, including the two deliberate refusals: `blocked` (the
+     * gateway is up and the tunnel is not started because the local GUI's
+     * browser-trust fence refuses the authority browsers use) and `untested`
+     * (this configuration has never passed a connection test, so nothing is
+     * dialed and nothing is bound). Both are served-nothing states, not
+     * transient ones.
      */
     tunnel: TunnelSnapshot | null
     /** What the local GUI answered for the authority browsers use. */

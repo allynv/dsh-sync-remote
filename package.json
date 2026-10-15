@@ -1,6 +1,6 @@
 {
   "name": "@allynv/dsh-sync-remote",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Reverse SSH tunnel plus a passkey-gated public entry in front of this DSH Web GUI.",
   "repository": {
     "type": "git",

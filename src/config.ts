@@ -17,6 +17,8 @@
  * @module @allynv/dsh-sync-remote/config
  */
 
+import { createHash } from 'node:crypto'
+import { isIP } from 'node:net'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { isVolatile } from '@deepseek-ai/cosmokit'
@@ -197,6 +199,72 @@ export interface ResolvedConfig {
  */
 export function defaultStateFile(): string {
   return join(homedir(), '.dsh', 'dsh-sync-remote', 'state.json')
+}
+
+/**
+ * Why one host string can never work as a connection target, decided without
+ * touching the network.
+ *
+ * Only the shapes a *typo* produces are refused here — a four-part all-numeric
+ * address whose octets are out of range (`185.201.227.601`), the SSH port pasted
+ * into the address (`vps.example.com:22`), a URL or `user@host`, an address in
+ * brackets, or any character no host name can carry. Everything else is left to
+ * the connection test, because "a well-formed address that is not your VPS" is
+ * not detectable offline at all.
+ * @param host - the configured `tunnel.host`.
+ * @returns one clause for the diagnostic, or null when the value is plausible.
+ */
+export function tunnelHostProblem(host: string): string | null {
+  const value = host.trim()
+  if (value === '') return 'is empty'
+  if (/[\s@/\\]/u.test(value)) return 'must be a bare host name or IP address, not a URL or user@host'
+  if (value.startsWith('[') || value.endsWith(']')) {
+    return 'must not be wrapped in brackets — write an IPv6 address as ::1, not [::1]'
+  }
+  if (isIP(value) !== 0) return null
+  if (value.includes(':')) {
+    return /^[^:]+:\d{1,5}$/u.test(value)
+      ? 'looks like host:port — put the SSH port in "VPS SSH port", not in the address'
+      : 'is not a valid IP address'
+  }
+  if (/^(\d{1,3}\.){3}\d{1,3}$/u.test(value)) {
+    return 'is not a valid IPv4 address; each of its four parts must be 0–255'
+  }
+  if (value.length > 253) return 'is longer than 253 characters'
+  for (const label of value.replace(/\.$/u, '').split('.')) {
+    if (label === '') return 'has an empty part'
+    if (label.length > 63) return 'has a part longer than 63 characters'
+    if (!/^[A-Za-z0-9_-]+$/u.test(label)) return 'contains a character no host name carries'
+  }
+  return null
+}
+
+/**
+ * The identity of one tunnel configuration: the values a connection test
+ * actually proves.
+ *
+ * `host`, `port`, `user`, the key file and its passphrase are what the test
+ * dials with, so they are what a saved configuration is allowed to claim. The
+ * passphrase never rides in the clear: the digest is salted with the state
+ * file's own secret, so a leaked state file alone does not expose it to a
+ * dictionary. Values the test does not exercise (`serverPort`, `clientPort`, the
+ * public origin) are deliberately absent — changing them must not demand a new
+ * test.
+ * @param config - the resolved configuration.
+ * @param secret - the state file's secret, used as the salt.
+ * @returns the fingerprint as lowercase hex.
+ */
+export function tunnelFingerprint(config: ResolvedConfig, secret: string): string {
+  const passphrase = config.tunnel.passphrase === undefined
+    ? null
+    : createHash('sha256').update(secret).update('\u0000').update(config.tunnel.passphrase).digest('hex')
+  return createHash('sha256').update(JSON.stringify({
+    host: config.tunnel.host,
+    port: config.tunnel.port,
+    user: config.tunnel.user,
+    privateKeyFile: config.tunnel.privateKeyFile,
+    passphrase,
+  })).digest('hex')
 }
 
 /**
@@ -436,6 +504,17 @@ export function resolveConfig(raw: RowConfig = {}, sources?: Provenance): Resolv
           `dsh-sync-remote: ${path} is required — an enabled tunnel needs it (set tunnel.enabled to false to run the gateway alone)`,
         )
       }
+    }
+    // A value that can never name a host is refused outright: dialing it would
+    // produce nothing but `getaddrinfo ENOTFOUND`, and the settings page's red
+    // banner names the field instead. Only the shapes a typo produces are
+    // caught here; whether a well-formed address reaches the VPS is the
+    // connection test's verdict, not this module's guess.
+    const problem = tunnelHostProblem(vpsHost as string)
+    if (problem !== null) {
+      throw new ConfigError(
+        `dsh-sync-remote: tunnel.host ${JSON.stringify(vpsHost)} ${problem} (set it in Settings → Remote access)`,
+      )
     }
   }
 

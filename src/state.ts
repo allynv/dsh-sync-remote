@@ -1,6 +1,7 @@
 /**
  * Durable plugin state: the cookie-signing secret, the stable WebAuthn user
- * handle, the registered passkeys, and the trusted SSH host-key fingerprint.
+ * handle, the registered passkeys, the trusted SSH host-key fingerprint, and the
+ * tunnel configurations a connection test has proven.
  *
  * The file is the only thing standing between a stranger and a passkey
  * enrollment, so a corrupt or unreadable state file fails the plugin load
@@ -13,10 +14,18 @@
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { randomText, fromBase64Url } from './encoding.ts'
-import type { StateDocument } from './types.ts'
+import type { StateDocument, TunnelTestRecord } from './types.ts'
 
 /** State-file layout version; a bump means an incompatible on-disk shape. */
 const STATE_VERSION = 1
+
+/**
+ * How many proven configurations are remembered.
+ *
+ * Enough to survive "tested new values, then did not save", "saved but the Host
+ * refused the write", and a few rounds of editing, without the file growing.
+ */
+const MAX_TUNNEL_TESTS = 8
 
 /** @returns a fresh, unpersisted state for a deployment that has none yet. */
 export function createState(): StateDocument {
@@ -27,6 +36,7 @@ export function createState(): StateDocument {
     userID: randomText(32),
     sshHostKey: null,
     passkeys: [],
+    tunnelTests: [],
   }
 }
 
@@ -61,6 +71,25 @@ function assertPasskey(value: unknown, index: number): void {
   if (value.transports !== undefined
     && (!Array.isArray(value.transports) || value.transports.some(entry => typeof entry !== 'string'))) {
     throw new Error(`state: ${at}.transports must be an array of strings`)
+  }
+}
+
+/**
+ * Accept one stored "this configuration was tested" record.
+ * @param value - one entry of the stored `tunnelTests` array.
+ * @param index - its position, for the diagnostic.
+ */
+function assertTunnelTest(value: unknown, index: number): void {
+  const at = `tunnelTests[${String(index)}]`
+  if (!isRecord(value)) throw new Error(`state: ${at} is not an object`)
+  if (typeof value.fingerprint !== 'string' || value.fingerprint === '') {
+    throw new Error(`state: ${at}.fingerprint must be a non-empty string`)
+  }
+  if (typeof value.at !== 'number' || !Number.isSafeInteger(value.at) || value.at < 0) {
+    throw new Error(`state: ${at}.at must be a non-negative integer`)
+  }
+  if (value.hostKey !== null && typeof value.hostKey !== 'string') {
+    throw new Error(`state: ${at}.hostKey must be a string or null`)
   }
 }
 
@@ -132,6 +161,17 @@ export async function loadStateOrCreate(file: string): Promise<{ state: StateDoc
     throw new Error(`dsh-sync-remote: state file ${file} has no passkeys array`)
   }
   parsed.passkeys.forEach(assertPasskey)
+  // `tunnelTests` is newer than the first releases: an older file simply has
+  // none, which reads as "no configuration has been proven yet" — the plugin
+  // then serves nothing until the operator runs one test.
+  if (parsed.tunnelTests === undefined) {
+    parsed.tunnelTests = []
+  } else {
+    if (!Array.isArray(parsed.tunnelTests)) {
+      throw new Error(`dsh-sync-remote: state file ${file} has no usable tunnelTests array`)
+    }
+    parsed.tunnelTests.forEach(assertTunnelTest)
+  }
   return { state: parsed as unknown as StateDocument, created: false }
 }
 
@@ -172,6 +212,22 @@ export class StateStore {
     if (mintedStatusToken) state.statusToken = randomText(24)
     if (created || mintedStatusToken) await this.persist()
     return this.state
+  }
+
+  /**
+   * Remember that one configuration passed a connection test.
+   *
+   * Only a real test writes this, and only the running plugin reads it: the
+   * settings page cannot claim a configuration is trustworthy.
+   * @param fingerprint - identity of the tested configuration.
+   * @param hostKey - the host key the server presented, for display.
+   * @returns a promise settling when the write finished.
+   */
+  async rememberTunnelTest(fingerprint: string, hostKey: string | null): Promise<void> {
+    const record: TunnelTestRecord = { fingerprint, at: Date.now(), hostKey }
+    const kept = this.state.tunnelTests.filter(entry => entry.fingerprint !== fingerprint)
+    this.state.tunnelTests = [record, ...kept].slice(0, MAX_TUNNEL_TESTS)
+    await this.persist()
   }
 
   /**

@@ -33,8 +33,27 @@ export const TRUST_FORGET_PATH = '/api/sync-remote.trust.forget'
 /** Exact path that re-dials the tunnel now, instead of waiting out the backoff. */
 export const TUNNEL_RETRY_PATH = '/api/sync-remote.tunnel.retry'
 
+/** Exact path that proves a candidate tunnel configuration by dialing it once. */
+export const TUNNEL_TEST_PATH = '/api/sync-remote.tunnel.test'
+
 /** Exact path that ends an sshd on the VPS still holding the tunnel port (opt-in). */
 export const TUNNEL_RELEASE_PATH = '/api/sync-remote.tunnel.release'
+
+/**
+ * The tunnel fields a connection test may carry.
+ *
+ * Every field is optional: the page sends only what it can see, and the Host
+ * merges the rest from the row it already has (an omitted `passphrase` means
+ * "keep the stored one"; `null` means "this row has none").
+ */
+export interface TunnelTestPatch {
+  enabled?: boolean
+  host?: string
+  port?: number
+  user?: string
+  privateKeyFile?: string
+  passphrase?: string | null
+}
 
 /** One exact Fetch route, in the shape `ctx.connection.fetch.register` takes. */
 export interface FetchRoute {
@@ -79,6 +98,20 @@ export interface RouteSource {
    */
   retryTunnel(): Promise<{ ok: true } | { ok: false; reason: string }>
   /**
+   * Prove a candidate tunnel configuration by dialing it once.
+   *
+   * The settings page calls this before every write that touches the tunnel, and
+   * the running plugin refuses to dial a configuration this has not passed for.
+   * It only ever reads and dials: no remote forward is requested and nothing is
+   * bound on the VPS.
+   * @param patch - the draft values from the form; everything omitted comes from
+   * the current row.
+   * @returns the presented host key on success, or why the dial failed.
+   */
+  testTunnel(patch: TunnelTestPatch): Promise<
+    { ok: true; hostKey: string | null; verifiedAt: number; restarted: boolean } | { ok: false; reason: string }
+  >
+  /**
    * End an sshd on the VPS that still holds the tunnel port.
    *
    * The only action this plugin may take on the VPS, and it is off unless the row
@@ -98,6 +131,47 @@ export interface RouteSource {
  */
 function json(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers: { 'cache-control': 'no-store' } })
+}
+
+/**
+ * Accept only the fields a connection test may carry, and only as their real
+ * types.
+ *
+ * The patch becomes part of a resolved configuration and is then dialed, so a
+ * string where a number belongs is a `400` here rather than a TypeError deeper
+ * in, and an unknown field is simply not part of the shape.
+ * @param body - the parsed JSON body.
+ * @returns the patch, or one message naming what was wrong.
+ */
+function parseTunnelTestPatch(body: unknown): { patch: TunnelTestPatch } | { error: string } {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return { error: 'the request body must be a JSON object' }
+  }
+  const source = body as Record<string, unknown>
+  const patch: TunnelTestPatch = {}
+  if (source.enabled !== undefined) {
+    if (typeof source.enabled !== 'boolean') return { error: '"enabled" must be a boolean' }
+    patch.enabled = source.enabled
+  }
+  for (const field of ['host', 'user', 'privateKeyFile'] as const) {
+    const value = source[field]
+    if (value === undefined) continue
+    if (typeof value !== 'string') return { error: `"${field}" must be a string` }
+    patch[field] = value
+  }
+  if (source.port !== undefined) {
+    if (typeof source.port !== 'number' || !Number.isSafeInteger(source.port)) {
+      return { error: '"port" must be a whole number' }
+    }
+    patch.port = source.port
+  }
+  if (source.passphrase !== undefined) {
+    if (source.passphrase !== null && typeof source.passphrase !== 'string') {
+      return { error: '"passphrase" must be a string or null' }
+    }
+    patch.passphrase = source.passphrase
+  }
+  return { patch }
 }
 
 /**
@@ -196,6 +270,32 @@ export function registerRoutes(registry: RouteRegistry, source: RouteSource, log
         const reason = error instanceof Error ? error.message : String(error)
         log.error(`dsh-sync-remote: retrying the tunnel failed: ${reason}`)
         return json({ error: 'the retry failed; see the DSH log' }, 500)
+      }
+    },
+  })
+
+  registry.register({
+    path: TUNNEL_TEST_PATH,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      let body: unknown
+      try {
+        body = await request.json()
+      } catch {
+        return json({ error: 'the request body is not valid JSON' }, 400)
+      }
+      const parsed = parseTunnelTestPatch(body)
+      if ('error' in parsed) return json({ error: parsed.error }, 400)
+      try {
+        const result = await source.testTunnel(parsed.patch)
+        // A failed test is a state the page renders ("these values do not
+        // work"), never a server error.
+        return result.ok ? json(result) : json({ error: result.reason }, 409)
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        log.error(`dsh-sync-remote: the connection test failed unexpectedly: ${reason}`)
+        return json({ error: 'the connection test failed; see the DSH log' }, 500)
       }
     },
   })

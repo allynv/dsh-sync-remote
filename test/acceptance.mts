@@ -294,8 +294,16 @@ try {
   report = JSON.parse(response.body) as GatewayStatus
 } catch (error) {
   const missing = statusToken === '' ? `${stateFile} holds no read-only status token (restart dsh once so it mints one), and ` : ''
+  // Two of the three reasons this gateway is legitimately absent are *by design*,
+  // and a message that only says "check --port" sends the operator looking for a
+  // fault that is not there: an untested configuration and a refused fence each
+  // leave this process with no listener at all.
+  const designed = 'Note that the gateway deliberately does not listen when (a) the tunnel configuration has never passed 「测试连接 / Test connection」, '
+    + 'or (b) DSH was started without --trusted-host, so its fence refuses this Host. '
+    + 'Settings → 远程访问 / Remote access names which one it is; fix that, then run this script again.'
   fatal(`Cannot continue: ${missing}the passkey gateway on ${gatewayAuthority} did not report its state (${reasonFor(error)}). `
-    + 'Check --port, and read the port and public origin the running gateway resolved — and whether it is serving at all — in Settings → 远程访问 / Remote access.')
+    + 'Check --port, and read the port and public origin the running gateway resolved — and whether it is serving at all — in Settings → 远程访问 / Remote access.\n'
+    + designed)
 }
 
 const publicOrigin = report.origin
@@ -337,10 +345,13 @@ await check('the passkey gateway reports the deployment it serves', () => {
     // `blocked` is the deliberate refusal: the plugin never requested a remote
     // forward because the GUI's fence refuses the public authority. It is the one
     // state whose cause is not in the tunnel at all, so it says so instead of
-    // printing an empty `lastError`.
+    // printing an empty `lastError`. `untested` is the other deliberate refusal:
+    // these values have never passed a connection test, so nothing was dialed.
     const why = tunnel.state === 'blocked'
       ? 'the GUI refused the public Host, so the plugin opened no tunnel; restart dsh web with --trusted-host'
-      : (tunnel.lastError ?? 'no error reported')
+      : tunnel.state === 'untested'
+        ? 'this tunnel configuration has not been verified; open Settings → Remote access and press 「测试连接 / Test connection」'
+        : (tunnel.lastError ?? 'no error reported')
     throw new Error(`the tunnel is ${tunnel.state} (${why}); a configured tunnel must be listening`)
   }
   const tunnelNote = tunnel === null ? 'off' : `${tunnel.state} attempts=${String(tunnel.attempts)} channels=${String(tunnel.channels)}`
@@ -403,7 +414,10 @@ await check('a refused fence means no listener, not a broken login page', async 
     throw new Error(`the fence refuses ${publicAuthority} (403) while the tunnel is listening: a remote visitor reaches a login page in front of an /api that 403s everything`)
   }
   if (fence.status === 401 && state !== 'listening' && state !== 'disabled') {
-    throw new Error(`the fence accepts ${publicAuthority} (401) but the tunnel is ${state}: the public entry point should be up (${tunnel?.lastError ?? 'no error reported'})`)
+    const hint = state === 'untested'
+      ? 'run the connection test in Settings → Remote access; a configuration is only dialed once a test has proven it'
+      : (tunnel?.lastError ?? 'no error reported')
+    throw new Error(`the fence accepts ${publicAuthority} (401) but the tunnel is ${state}: the public entry point should be up (${hint})`)
   }
   return `fence ${String(fence.status)} → tunnel ${state}${fence.status === 403 ? ' (nothing exposed, deliberately)' : ''}`
 })

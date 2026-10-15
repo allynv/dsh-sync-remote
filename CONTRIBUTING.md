@@ -63,19 +63,20 @@ npm run build:watch    # 开发时挂在旁边
 | :--- | :--- |
 | [src/index.ts](src/index.ts) | 插件入口：装配、启动探测、日志、生命周期；`PluginContext` 声明 `effect` 与可选的 `inject`；一次性链接的文件生命周期 |
 | [src/types.ts](src/types.ts) | 跨模块共享类型：`Logger`、`PasskeyRecord`、`PasskeySummary`、`StateDocument` |
-| [src/config.ts](src/config.ts) | 设置表单的 `Config` schema（11 个字段）、`resolveConfig()`（不读环境变量、派生固定值）、`provenance()` |
-| [src/state.ts](src/state.ts) | 状态文件：签名密钥、只读状态令牌、WebAuthn userID、Passkey、主机指纹；原子写（含 Windows 上被并发读取时的重命名重试） |
+| [src/config.ts](src/config.ts) | 设置表单的 `Config` schema（11 个字段）、`resolveConfig()`（不读环境变量、派生固定值）、`provenance()`、`tunnelHostProblem()`（离线地址语法闸门）、`tunnelFingerprint()`（"这组值被测试证明过"的标识） |
+| [src/state.ts](src/state.ts) | 状态文件：签名密钥、只读状态令牌、WebAuthn userID、Passkey、主机指纹、已验证配置指纹环（`tunnelTests`）；原子写（含 Windows 上被并发读取时的重命名重试） |
 | [src/session-cookie.ts](src/session-cookie.ts) | HMAC 签名 Cookie 的签发/校验；四种 Cookie 名与受众词汇（`session` / `next` / `enrollment`）都声明在这里 |
 | [src/webauthn.ts](src/webauthn.ts) | 注册/登录 ceremony，challenge 一次性、5 分钟过期 |
 | [src/gateway.ts](src/gateway.ts) | HTTP+WebSocket 反向代理、鉴权、一次性注册令牌（mint/消费/TTL）、DSH 自动登录重定向、限流、预检 |
-| [src/tunnel.ts](src/tunnel.ts) | `ssh2` 反向隧道、保活、指数退避+抖动、失败分类（`TunnelFailureKind`）与升级/节流、主机密钥 TOFU 校验（`TunnelState`）、`stop/start` 的 generation 计数、可选的在 VPS 上释放被占端口 |
+| [src/tunnel.ts](src/tunnel.ts) | `ssh2` 反向隧道、保活、指数退避+抖动、失败分类（`TunnelFailureKind`）与升级/节流、主机密钥 TOFU 校验（`TunnelState`）、`stop/start` 的 generation 计数、未验证配置闸门（`untested`）、本地 listener 的延迟绑定、可选的在 VPS 上释放被占端口 |
+| [src/probe.ts](src/probe.ts) | 「测试连接」的实现：只拨一次 SSH 并认证（不请求任何远端转发、不写主机密钥钉），主机密钥只比对；失败按隧道同一套 `classifySshFailure` 分类 |
 | [src/remote-release.ts](src/remote-release.ts) | 唯一会在 VPS 上动手的能力：固定命令、严格解析 `ss -ltnpH` 输出、只在证明占用者是 sshd 时给出 `kill`（无 SSH 客户端，纯决策，因此可离线测试） |
 | [src/pages.ts](src/pages.ts) | 登录/注册页面的 HTML/CSP，并读取构建产物 `lib/app.js` 作为页面脚本 |
 | [src/app.ts](src/app.ts) | 登录页脚本本体（真 TS，零 import）：WebAuthn 选项/响应转换与两条仪式流程 |
 | [src/status.ts](src/status.ts) | 设置页的数据形状：`buildStatus()` 纯函数，装配有效值、来源、固定值、设备与运行状态（**不含任何令牌**） |
-| [src/routes.ts](src/routes.ts) | 六个 `/api/sync-remote.*` 路由（state / enroll.mint / passkey.remove / trust.forget / tunnel.retry / tunnel.release）：JSON、`no-store`、错误映射 |
+| [src/routes.ts](src/routes.ts) | 七个 `/api/sync-remote.*` 路由（state / enroll.mint / passkey.remove / trust.forget / tunnel.retry / tunnel.test / tunnel.release）：JSON、`no-store`、错误映射 |
 | [src/qr.ts](src/qr.ts) | 二维码渲染（`qrcode-generator`，Byte 模式）→ SVG data URL |
-| [src/client.ts](src/client.ts) | 设置页本体（真 TS，构建为 `lib/client.js`）：字段表单、固定值列表、生成二维码、设备管理、状态面板 |
+| [src/client.ts](src/client.ts) | 设置页本体（真 TS，构建为 `lib/client.js`）：字段表单、固定值列表、生成二维码、设备管理、状态面板、「测试连接」按钮与"改隧道字段必须先测通过才允许保存"的闸门 |
 | [test/selfcheck.mts](test/selfcheck.mts) | 自测（数量以输出为准）：配置派生、Cookie 签名、状态文件、代理头、真实 WebSocket 往返、隧道退避与主机密钥、`apply()` 入口、控制台输出、探测时机、一次性链接生命周期、自动登录重定向、产物与路径护栏 |
 | [test/client.spec.mts](test/client.spec.mts) | 客户端半边冒烟测试：桩掉 `__ModuleLoader__`/React，真实渲染设置页并断言 i18n 键集相等、字段路径存在于 Host、选「自动」产生 unset、状态轮询存在且卸载时清理 |
 | [test/acceptance.mts](test/acceptance.mts) | 部署验收：从状态文件 + `/status` 自行发现部署，检查围栏、公网 HTTPS/WebSocket 与设置接口的匿名拒绝 |
@@ -187,7 +188,7 @@ ssh [-i <tunnel.privateKeyFile>] -p <tunnel.port> -N -R <serverPort>:127.0.0.1:<
 | :--- | :--- |
 | 一行本机链接 `dsh-sync-remote: http://127.0.0.1:3080/?token=…` | 解析后的配置、状态文件、端口 |
 | 配置被拒绝的 `error` | 网关已监听、预检通过 |
-| 隧道/上游的失败与异常（认证失败、主机密钥首次固定、断开重连、上游无响应、围栏 403/非 401 应答） | 登录成功、注册成功、隧道事件流 |
+| 隧道/上游的失败与异常（认证失败、主机密钥首次固定、断开重连、配置未验证、上游无响应、围栏 403/非 401 应答） | 登录成功、注册成功、隧道事件流 |
 | 一次性注册链接（含首台设备的自动生成） | 隧道关闭、隧道端口转发正常 |
 
 那行本机链接端口取 `clientPort`，令牌在**打印那一刻**向 Host 取（`authenticatedUrl()`），所以新起的进程、重载后的行都跟着最新的令牌走，不是写死的字符串。它和 `dsh web:` 那行是同一个进程凭据，**敏感度相同**。
@@ -204,7 +205,7 @@ ssh [-i <tunnel.privateKeyFile>] -p <tunnel.port> -N -R <serverPort>:127.0.0.1:<
 
 > 这次探测**等 Loader 装载完成之后**才发（插件向 Host 要 `loader.await()`，和 `web-app` 打印 `dsh web:` 用的是同一个时机）。否则 `/api` 的路由还没挂上，探测会拿到 404 并误报一条 "expected 401"——那描述的是启动瞬间，不是你的部署。
 
-**探测结果是网关与隧道共同的前置条件，不只是诊断。** 围栏回 `401` 之后才按顺序做两件事：`gateway.listen()` → `TunnelManager.start()`。围栏拒绝时**两件都不做**：不发出任何 `forwardIn`（VPS 上没有监听、没有登录页），**本机也不绑定网关端口**——这个 listener 存在的唯一目的就是把隧道的连接交给 GUI，没有隧道就没有要服务的东西；它唯一的另一个"顾客"是本机浏览器，而报告这次拒绝的设置页由 **DSH 自己**在 3080 上提供，从不经过这个 listener。少一个 listener 就少一样要解释、少一样能被找到的东西。
+**探测结果是网关与隧道共同的前置条件，不只是诊断。** 围栏回 `401` 之后，`TunnelManager.start()` 先过"配置指纹"闸门（见下面的「测试连接与配置指纹」），然后才拨号；等 SSH 会话**认证成功（`ready`）**，才 `gateway.listen()` 把本机 listener 绑起来，紧接着发 `forwardIn`。围栏拒绝、指纹不符、私钥/口令/认证/主机密钥失败时**什么都不做**：没有 `forwardIn`（VPS 上没有监听、没有登录页），**本机也不绑定网关端口**——这个 listener 存在的唯一目的就是把隧道的连接交给 GUI，没有隧道就没有要服务的东西；它唯一的另一个"顾客"是本机浏览器，而报告这些拒绝的设置页由 **DSH 自己**在 3080 上提供，从不经过这个 listener。少一个 listener 就少一样要解释、少一样能被找到的东西。
 
 由此还带来两个连带约定：
 
@@ -215,30 +216,61 @@ ssh [-i <tunnel.privateKeyFile>] -p <tunnel.port> -N -R <serverPort>:127.0.0.1:<
 - **不确定的答复也按"不暴露"处理**（fail closed），并给出与 403 不同的原因文案。
 - **不做常驻轮询**：`--trusted-host` 是 `dsh web` 的启动参数（`ctx.webStartup.trustedHosts`），进程存活期间不可能改变。因此不存在需要轮询的对象——进程重启、插件行重载（设置页保存即触发）、以及「重新信任」这三条路径都会重跑这次判定。
 - 状态用隧道的 `blocked` 表示（不是 `configError`：fence 不过不是本插件的配置错误），设置页对它显示专用横幅，**不会**显示那句讲 ssh2 原始错误的提示。
+- 配置**未被测试验证过**时用隧道的 `untested` 表示：同样不拨号、不绑 listener、不重试，设置页显示"先点「测试连接」"的横幅。它和 `blocked` 的区别是"能不能从这一页修好"：`blocked` 要去改 `dsh web` 的启动参数，`untested` 点一下测试就能过。
 - 只有两个地方能启动隧道：`startTunnel` 里 `tunnel.enabled: false` 的分支（没东西可 gate），和 gate 自己。selfcheck 有一条源码守卫盯着这个数字。
 - **围栏问的是"公网地址那个 authority"**，所以 `--trusted-host` 写成别的域名、或多写了端口，同样是 `blocked`——这正是要的行为。启动参数可读时（`ctx.get('webStartup')`，可选服务）403 文案会列出 DSH 实际信任的列表；`--public-url` 与插件「公网地址」不一致只警告（它是广告，不是信任）。
+
+### 测试连接与配置指纹
+
+隧道**只拨号一组被测试证明过的值**。这条规则由两半合起来强制，因为 Host 侧的设置写入没法被插件否决（schema 级拒绝会卸载插件行，是本仓库刻意避免的失败模式）：
+
+- **页面半边**：`保存并应用` 发现草稿动了指纹字段（`tunnel.host/port/user/privateKeyFile/passphrase`）时，先 `POST /api/sync-remote.tunnel.test` 测这份草稿，成功才 `form.mutate()`。测的候选值和要写进去的值走同一个 `resolveConfig()`，所以二者不可能不是同一组值。顶部还有一个手动「测试连接」按钮，用于"只是没验证过、值没改"的情形。
+- **运行半边**：`tunnelFingerprint(config, secret)` = `host, port, user, privateKeyFile, passphrase(用状态文件密钥加盐的哈希)` 的 sha256。测试成功时把它前插进状态文件的 `tunnelTests`（最多 8 条，最新在前）。每次插件行加载，`TunnelManager.start()` **在读私钥之前**先比对当前指纹；不在环里就进 `untested`：不读密钥、不拨号、不绑 listener、不设重连定时器。
+
+为什么是"环"而不是一条：**测试了新值但没保存**（或保存被 Host 回滚、进程在保存前重启）时，正在运行的那组值必须仍然是已验证的，否则一次试错就会把好隧道停掉。
+
+**测试做什么**（[src/probe.ts](src/probe.ts)）：离线地址语法检查 → 读并解析私钥 → `connect()` + 认证成功 = 通过；`hostVerifier` **只比对钉、不写钉**（TOFU 仍只发生在隧道自己第一次连上时），不一致则以 `host-key` 失败并给出两边指纹。它**不请求任何远端转发**，所以 VPS 上不会因为一次测试多出一个监听端口。
+
+**哪些错误能精准定位到某一项**（这决定了上面那些文案）：
+
+| 阶段 | 信号 | 能定位到 |
+| :--- | :--- | :--- |
+| 地址语法 | 四段全数字但 `net.isIP() !== 4`、`host:22`、`ssh://`、`user@host`、`[::1]`、含空格 | `tunnel.host`（**离线**判定，`tunnelHostProblem`，也是 `resolveConfig` 的拒绝理由） |
+| 读私钥 | `ENOENT`/`EACCES` | `tunnel.privateKeyFile`（路径/权限） |
+| 解析私钥 | `Unsupported key format`、`Malformed …` | `tunnel.privateKeyFile`（格式/内容） |
+| 解析私钥 | `… no passphrase given`、`… bad passphrase?` | `tunnel.passphrase`（未填 / 填错，`keyRejectedMessage` 分开报） |
+| 名字解析 | `getaddrinfo ENOTFOUND` | `tunnel.host`（这个主机名没有记录） |
+| 主机密钥 | 出示指纹 ≠ 已固定 | 事实精准，但"地址写错 / VPS 重装 / 中间人"三选一，要靠人比对指纹 |
+| 身份认证 | `All configured authentication methods failed` | 事实精准，但"用户写错 / 公钥没授权 / sshd 策略"三选一 |
+| 远端转发 | `forwardIn` → `Unable to bind` | 事实精准：VPS 上那个端口被占；占用者是上次会话（瞬时）还是别的常驻服务（端口选错）不定 |
+| 连接/握手 | `ECONNREFUSED`、`ETIMEDOUT`、`client-timeout`、`EAI_AGAIN` | **无法归因**：地址写错、VPS 关机、sshd 停了、防火墙挡、本机断网，全部同形 |
+
+最后一行就是"测试 + 指纹"存在的理由：协议层给不出唯一归因，那就用"这组值验证过没有"来分流——验证过 ⇒ 失败是环境问题，继续重连；没验证过 ⇒ 一根手指都不动，先测。
 
 ### SSH 失败分类与重试策略
 
 每一次连接失败都会先被**分类**（`TunnelFailureKind`，[src/tunnel.ts](src/tunnel.ts)），因为"未连接"本身不是可行动的信息。分类决定三件事：要不要重试、页面说什么、退避多快。
 
+**前提**：能走到这里，说明指纹闸门已经放行——这组值被测试证明过。
+
 | kind | 来源 | 自动重试 | 页面/控制台 |
 | :--- | :--- | :--- | :--- |
-| `key` | 私钥读不到，或 ssh2 解析不了（PKCS#8） | **否**（终态：改配置或行重载才恢复） | 指出文件路径与支持的格式 |
+| `key` | 私钥读不到，或 ssh2 解析不了（PKCS#8、口令缺失/错误） | **否**（终态：改配置或行重载才恢复） | 指出文件路径、支持的格式，或口令 |
 | `auth` | ssh2 `client-authentication` / `agent` | **否** | 指向 SSH 用户 / 私钥 / 口令 |
 | `host-key` | 已固定指纹与服务器不符 | **否**，直到「重新信任」 | 指向设置页的「重新信任」 |
-| `dns` | `client-dns` / `ENOTFOUND` | 是 | 指向 `tunnel.host` |
+| `local` | `ensureLocal()` 失败：本机 `<serverPort>` 绑不上（多半被别的进程占用） | **否**（终态：改端口或释放它） | 指向「服务端端口」 |
+| `dns` | `client-dns` / `ENOTFOUND` | 是 | 指向 `tunnel.host` / 本机 DNS |
 | `unreachable` | `client-socket`（ECONNREFUSED 等） | 是 | 指向地址 / SSH 端口 / VPS 状态 |
 | `handshake-timeout` | `client-timeout`（`readyTimeoutMs`=20 s） | 是 | 同上 + 端口是否被墙 |
-| `forward-refused` | `forwardIn` 回调失败（VPS 端口被占） | 是（**不**升级） | 给出 `ss -ltnp` 与 `ClientAliveInterval` |
+| `forward-refused` | `forwardIn` 回调失败（VPS 端口被占） | 是 | 给出 `ss -ltnp` 与 `ClientAliveInterval` |
 | `dropped` | ready 之后连接消失、无 ssh2 错误 | 是（**不**升级） | 说明会自动重连、期间 502 |
 | `unknown` | 其他 level | 是 | 保留 ssh2 原文 |
 
 三条机制：
 
-- **升级**：`attempts ≥ 5` 且**从未成功过**（`everListening === false`）⇒ 快照 `suspected='configuration'`，退避上限从 `reconnectMaxDelayMs`（60 s）换成 `suspectedReconnectMaxDelayMs`（5 min）。只影响"从没成功过"的部署：刚工作过的隧道断线仍按 1 分钟档重连（那是 VPS 重启，不是配置错）。`suspected` 是**派生**字段，`start()` 清零 attempts 后自然消失。
+- **升级**：`attempts ≥ 5` 且**从未成功过**（`everListening === false`）⇒ 快照 `suspected='configuration'`，退避上限从 `reconnectMaxDelayMs`（60 s）换成 `suspectedReconnectMaxDelayMs`（5 min）。只影响"从没成功过"的部署：刚工作过的隧道断线仍按 1 分钟档重连（那是 VPS 重启）。注意 `suspected` 只是**退避档位**的意思：配置是验证过的，所以控制台和页面都不再说"疑似配置错误"，而是说"按网络/VPS 问题继续重连"。`suspected` 是**派生**字段，`start()` 清零 attempts 后自然消失。
 - **节流**：失败日志首次完整打印，之后仅在**类别变化**或**每 10 次**（`LOG_EVERY_ATTEMPTS`）打一行——控制台是"需要人处理"的信道，不是日志文件；实时状态在设置页（10 s 轮询）。
-- **手动**：`POST /api/sync-remote.tunnel.retry`（页面「立即重试」）走 `tunnel.stop()` + `startTunnel()`，**和启动完全同一条路**，因此仍过围栏 gate，不可能是绕过 `blocked` 的后门。
+- **手动**：`POST /api/sync-remote.tunnel.retry`（页面「立即重试」）走 `tunnel.stop()` + `startTunnel()`，**和启动完全同一条路**，因此仍过围栏 gate 和指纹闸门，不可能是绕过 `blocked` / `untested` 的后门。
 
 ### 主动释放 VPS 上被占的隧道端口
 
@@ -284,7 +316,7 @@ node test/selfcheck.mts
 node test/client.spec.mts
 ```
 
-期望：最后一行为 `N/N checks passed`（N 随版本增长），退出码 0。这一段证明的是**代码本身**：签名 Cookie、配置解析与来源标注（含"环境变量完全不影响结果"）、状态文件、代理头改写、经代理的真实 WebSocket 101 往返、隧道退避与主机密钥、设置页的 Config schema / 状态载荷 / 路由拒绝路径、一次性注册链接的生成-替换-退役、DSH 自动登录重定向（含防循环）、`apply()` 入口、拒绝配置时不卸载、销毁，以及产物与路径护栏。
+期望：最后一行为 `N/N checks passed`（N 随版本增长），退出码 0。这一段证明的是**代码本身**：签名 Cookie、配置解析与来源标注（含"环境变量完全不影响结果"）、地址语法闸门与配置指纹、状态文件（含"旧文件没有指纹环也能加载"）、代理头改写、经代理的真实 WebSocket 101 往返、隧道退避与主机密钥、**对着一个 ssh2 真服务器跑通的连接测试**（成功 / 认证拒绝 / 主机密钥不符且不写钉 / 不可达）、设置页的 Config schema / 状态载荷 / 路由拒绝路径、一次性注册链接的生成-替换-退役、DSH 自动登录重定向（含防循环）、`apply()` 入口、拒绝配置时不卸载、指纹闸门（未验证不拨号）、销毁，以及产物与路径护栏。
 
 ### B 段 · 部署验收（一条命令，对着真在跑的服务）
 
@@ -332,7 +364,7 @@ node test/acceptance.mts --state <file>   # 状态文件不是默认路径时
 3. **实时同步**：电脑和手机同时打开 GUI，一边发一条消息。期望另一边**实时**出现（走 `/api/remote.mux`）。这是"WebSocket 代理是否真的通"的唯一硬证据。
 4. **Cookie 属性**：DevTools → Application → Cookies，确认 `dsh-gw-session` 是 `HttpOnly`、`Secure`、`SameSite=Strict`。
 5. **断开恢复**：把 VPS 网络断 1 分钟再恢复。期望日志出现 `tunnel lost (…) reconnecting in … ms`，随后自动恢复。
-6. **错误凭据**：把私钥路径改成错文件、或把 SSH 用户名写错，保存。期望明确的认证失败信息（不是无限刷屏）。
+6. **错误凭据在保存前就被拦住**：把「私钥绝对路径」改成一个不存在的文件、或把「SSH 用户」改成一个不存在的名字，点「保存并应用」。期望：页面先显示「隧道设置改了：先测试连接」，然后给出具体原因（`key` 指路径/格式/口令，`auth` 指用户或密钥授权），**配置一个字节也没写**、插件行**没有重启**。改回正确值再保存才通过。
 7. **锁死保护**：删到只剩 1 把 Passkey。期望最后一个的删除按钮被禁用（Host 侧也会拒绝：`refusing to remove the last passkey`）。
 8. **一次性链接**：生成二维码后再打开同一个链接一次。期望链接已失效（403）、`enroll-url.txt` 已删除；点「重新生成」得到的新链接可用、旧的立即失效。
 9. **不带 `--trusted-host` 重启（本插件最重要的安全性质，必须人来做）**：把启动命令里的 `--trusted-host` 去掉，重启 DSH。
@@ -340,9 +372,10 @@ node test/acceptance.mts --state <file>   # 状态文件不是默认路径时
    **关键两步**：① 在 VPS 上 `sudo ss -ltnp | grep 3090` 应当**无任何输出**（插件连 `forwardIn` 都没发）；② 本机 `Test-NetConnection 127.0.0.1 -Port 3090` 应当**失败**（网关 listener 也没绑）。两处都没有，就不存在"能登录但界面空白"的机会。
    把 `--trusted-host` 加回去重启，隧道应恢复 `listening`、公网恢复可用（自愈路径：进程重启 / 插件行重载 / 「重新信任」三者都会重跑判定）。
 10. **设置页可编辑性**：在运行 DSH 的机器上用 `http://127.0.0.1:<clientPort>` 打开设置页 → 输入框可输入、「保存并应用」可用；再从公网域名打开同一页 → 只读 + 黄色说明横幅（**不报错、不是故障**）。这一步是 v1.1.0 修的那个"到处都不能编辑"（页面曾按一个 DSH 不存在的字段判断可写性）。
-11. **失败分类不重试**：把「SSH 用户」改成一个不存在的名字并保存。期望：设置页顶部隧道显示 `failed (auth)`，横幅给出"SSH 认证被拒 / 检查用户、私钥、口令"，控制台**只多一行**，而且**不会**继续刷重连日志（终态）。改回正确值保存即恢复。
-12. **配置错误的升级与节流**：把「VPS 的 SSH 端口」改成 `1`（或一个被防火墙丢弃的端口）并保存。期望：前 5 次快速重试（日志只在第 1 次、第 10 次…才打一行），随后页面出现「**疑似配置错误**」提示、状态行出现 `下次重试 <n>s`，VPS 不再每分钟被敲；点「立即重试」立即再拨一次。
-13. **释放 VPS 上被占的端口（可选能力）**：在 VPS 上人为制造占用——从另一台机器 `ssh -N -R 127.0.0.1:3090:127.0.0.1:1 root@<VPS>` 后**强杀**其客户端进程（模拟僵死会话）。期望：本机日志出现 `VPS 拒绝监听 127.0.0.1:3090` 与 `ss -ltnp` 提示。开关关闭时：只报告、不动作；打开「释放 VPS 端口」并保存后：连续 3 次拒绝即自动执行（或点横幅里的按钮），日志打印**证据行与被杀掉的 PID**，随后隧道恢复 `listening`。同时确认：占用者不是 sshd 时（例如 `python -m http.server 3090` 那种场景）插件**只报告**。
+11. **未验证的配置不启动远程服务（防手改）**：手工编辑 profile 里的「VPS 地址」（例如改成另一个合法 IP）并重启 DSH。期望：行加载成功，控制台出现一行 `this tunnel configuration has not been verified with a test connection …`；设置页网关显示「未启动」、隧道显示 `untested（配置未验证）` + 专用横幅，**不会**出现讲 ssh2 原始错误的提示。**关键两步**：① VPS 上 `sudo ss -ltnp | grep 3090` 应**无任何输出**（连 SSH 会话都没开）；② 本机 `Test-NetConnection 127.0.0.1 -Port 3090` 应**失败**（listener 也没绑）。回设置页点「测试连接」：值对就恢复 `listening`，值错就在这一步报出来——不写入、不重试。
+12. **测试连接不碰 VPS 的转发**：在隧道正常工作时点一次「测试连接」。期望：页面显示「连接成功：已认证 …；服务器出示的主机密钥 …（与已固定一致）」；VPS 上原有的 3090 监听**不受影响**（测试只认证，不请求任何远端转发），本机隧道不断，页面上的状态也不掉。
+13. **非法地址被当场拒绝**：把「VPS 地址」改成 `185.201.227.601`。期望：输入框旁就地报「IP 地址无效：四段都必须在 0–255 之间」；改成 `vps.example.com:22` 则报「这看起来是「地址:端口」」。再把它手改进 profile 并重启 DSH：期望行级 `configError`（配置被拒绝），网关与隧道都不建、什么都不开——连"先测试"都不需要，因为这个值永远不可能是主机。
+14. **释放 VPS 上被占的端口（可选能力）**：在 VPS 上人为制造占用——从另一台机器 `ssh -N -R 127.0.0.1:3090:127.0.0.1:1 root@<VPS>` 后**强杀**其客户端进程（模拟僵死会话）。期望：本机日志出现 `VPS 拒绝监听 127.0.0.1:3090` 与 `ss -ltnp` 提示。开关关闭时：只报告、不动作；打开「释放 VPS 端口」并保存后：连续 3 次拒绝即自动执行（或点横幅里的按钮），日志打印**证据行与被杀掉的 PID**，随后隧道恢复 `listening`。同时确认：占用者不是 sshd 时（例如 `python -m http.server 3090` 那种场景）插件**只报告**。
 
 ### D 段 · VPS 侧确认
 
@@ -391,5 +424,7 @@ sudo nginx -t && sudo systemctl reload nginx
 - `@deepseek-ai/schemastery` 与 `@deepseek-ai/cosmokit` 按**宿主 vendored 的同版本**（`3.18.5-alpha.1` / `1.8.6-alpha.1`）钉住：设置页靠 `schema.toJSON()` 的信封与宿主通信，版本漂移没有意义。它们从 npm 公开包安装，是这份 bundle 唯一两个 `@deepseek-ai/*` 依赖。
 - 设置页**不能**替你改 DSH 自己的两个命令行开关（`--trusted-host` / `--public-url`）：那是 `dsh web` 进程的启动参数，不属于本插件的行。页面只做预检，并据此**决定要不要开隧道**（预检不过就不开，见 §五「启动时的围栏探测」）。
 - 注册链接是**一次性**的：丢掉或过期就要重新生成。没有"固定注册令牌"这个选项——一个长期有效的注册凭据不值得留在磁盘上。
+- 升级到带「测试连接」的版本后，已有部署第一次启动是 `untested`（老状态文件没有 `tunnelTests`），需要点一次「测试连接」。这是刻意 **fail closed**：`sshHostKey` 只能证明"以前连过某台机器"，证明不了**当前这组值**对，所以不做祖父豁免。
+- 指纹里**不含** `serverPort` / `clientPort` / 公网地址：连接测试不验证它们，把它们算进指纹只会让改端口时白多点一次测试。代价与以前一样——`serverPort` 和 Nginx 的 `proxy_pass` 不一致时，公网 502 而设置页看着正常。
 - 自动登录重定向会把 DSH 的启动令牌放进一次 303 的 `Location`（随后 DSH 立即换成自己的 Cookie）。它是控制台本来就打印的那个凭据；若你不想让它出现在浏览器历史里，可以关掉这一行为（[src/index.ts](src/index.ts) 里不传 `dshEntry`），代价是新设备注册后要手动打开一次 `dsh web` 打印的 `?token=` 链接。
 - 控制台是**启动界面**，不是日志文件：正常启动插件只补一行本机链接，其余只打需要人处理的事。

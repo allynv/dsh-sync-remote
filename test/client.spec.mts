@@ -153,6 +153,8 @@ let section: (() => AnyElement) | null = null
 let statusPayload: Record<string, any> = {}
 /** Every path the page fetched, so an action can be proven to have called its route. */
 const fetchedPaths: string[] = []
+/** What the next connection test answers; flipped by the checks below. */
+let testResult: { ok: boolean, error?: string } = { ok: true }
 
 const ctx = {
   effect(factory: () => unknown, label?: string) {
@@ -235,7 +237,7 @@ function configControls(tree: AnyElement): AnyElement[] {
 }
 
 /** Let the client's promises settle and re-render. */
-async function settle(times = 4): Promise<void> {
+async function settle(times = 12): Promise<void> {
   for (let i = 0; i < times; i += 1) await Promise.resolve()
 }
 
@@ -288,6 +290,13 @@ statusPayload = {
 ;(globalThis as any).fetch = async (path: string): Promise<any> => {
   fetchedPaths.push(String(path))
   if (String(path).includes('enroll.mint')) return { ok: true, status: 200, json: async () => ({ url: 'https://dsh.example.test/auth?token=x', qr: 'data:image/svg+xml;base64,AA', expiresAt: Date.now() + 600_000 }) }
+  // The connection test answers both ways: a pass proves the candidate, a
+  // failure must stop the write that was waiting on it.
+  if (String(path).includes('tunnel.test')) {
+    return testResult.ok
+      ? { ok: true, status: 200, json: async () => ({ ok: true, hostKey: 'SHA256:test', verifiedAt: 1, restarted: false }) }
+      : { ok: false, status: 409, json: async () => ({ error: testResult.error ?? 'the test failed' }) }
+  }
   return { ok: true, status: 200, json: async () => statusPayload }
 }
 ;(globalThis as any).styles = { insert: () => () => {} }
@@ -552,8 +561,12 @@ await check('a classified failure names the field to fix, and offers a retry', a
   await settle()
   const escalated = render()
   const escalatedText = renderedText(escalated)
-  assert.ok(escalatedText.includes('VPS 地址'), `a never-working deployment must point at the address and port:\n${escalatedText}`)
-  assert.ok(escalatedText.includes('一次都没成功过'), 'the escalation must say why it suspects the configuration')
+  // The configuration is proven by a test before it ever dials, so a long run of
+  // failures is not evidence of a typo any more: the copy says the values were
+  // verified and that the retry loop continues, with the way to re-test if the
+  // operator did change something.
+  assert.ok(escalatedText.includes('验证过'), `a long outage must not blame a verified configuration:\n${escalatedText}`)
+  assert.ok(escalatedText.includes('继续按最长 5 分钟间隔重连'), 'the escalation must say the reconnect loop continues')
   assert.ok(escalatedText.includes('下次重试'), 'the fact line must carry the countdown to the next attempt')
 
   fetchedPaths.length = 0
@@ -564,6 +577,79 @@ await check('a classified failure names the field to fix, and offers a retry', a
     ['/api/sync-remote.tunnel.retry'],
     `the retry control must call the Host route: ${JSON.stringify(fetchedPaths)}`,
   )
+
+  statusPayload = saved
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+})
+
+await check('a save that changes the tunnel is tested first, and written only if the test passes', async () => {
+  // The whole point of the feature: a value that cannot connect never reaches the
+  // configuration file, because a value that reaches it is one the running plugin
+  // is allowed to dial.
+  const saved = statusPayload
+  const before = mutations.length
+  control(render(), 'VPS 地址').props.onChange({ target: { value: '203.0.113.99' } })
+  await settle()
+
+  // (a) The dial fails: the write must not happen, and the reason must be visible.
+  testResult = { ok: false, error: 'client-socket: connect ECONNREFUSED 203.0.113.99:22' }
+  fetchedPaths.length = 0
+  button(render(), '保存并应用').props.onClick()
+  await settle()
+  assert.deepEqual(
+    fetchedPaths.filter(path => path.includes('tunnel.test')),
+    ['/api/sync-remote.tunnel.test'],
+    `the pending write must try the connection first: ${JSON.stringify(fetchedPaths)}`,
+  )
+  assert.equal(mutations.length, before, 'a failed connection test must persist nothing')
+  assert.match(renderedText(render()), /ECONNREFUSED/)
+
+  // (b) The same draft, proven: now the write goes through.
+  testResult = { ok: true }
+  button(render(), '保存并应用').props.onClick()
+  await settle()
+  assert.equal(mutations.length, before + 1, 'a passing test is what allows the write')
+  assert.ok(
+    JSON.stringify(mutations[mutations.length - 1]).includes('203.0.113.99'),
+    `the tested value must be the written value: ${JSON.stringify(mutations[mutations.length - 1])}`,
+  )
+  // The accepted write's own message wins: a save that succeeds must not still
+  // read as "testing…".
+  assert.match(renderedText(render()), /已保存/)
+
+  statusPayload = saved
+  testResult = { ok: true }
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+  mutations.length = before
+})
+
+await check('an unverified configuration is a state, not a failure, and carries its own test button', async () => {
+  const saved = statusPayload
+  statusPayload = {
+    ...saved,
+    runtime: {
+      ...saved.runtime,
+      tunnel: {
+        state: 'untested', kind: null, attempts: 0, channels: 0, remote: 'vps:22', hostKey: null,
+        everListening: false, nextRetryAt: null, suspected: null,
+        lastError: 'the configuration has not been verified with a test connection',
+      },
+    },
+  }
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+  const text = renderedText(render())
+  assert.match(text, /本次配置还没有验证过/)
+  assert.match(text, /untested（配置未验证）/)
+  assert.equal(/上面是 ssh2 报的原始原因/u.test(text), false, `nothing was attempted, so nothing failed:\n${text}`)
+
+  fetchedPaths.length = 0
+  button(render(), '测试连接').props.onClick()
+  await settle()
+  assert.deepEqual(fetchedPaths.filter(path => path.includes('tunnel.test')), ['/api/sync-remote.tunnel.test'])
+  assert.match(renderedText(render()), /连接成功/)
 
   statusPayload = saved
   button(render(), '刷新状态').props.onClick()

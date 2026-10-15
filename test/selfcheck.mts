@@ -14,25 +14,26 @@
 
 import assert from 'node:assert/strict'
 import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto'
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server } from 'node:http'
 import { connect as connectTcp } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { dirname, join } from 'node:path'
-import { ConfigError, defaultStateFile, resolveConfig, type ResolvedConfig } from '../src/config.ts'
+import { ConfigError, defaultStateFile, resolveConfig, tunnelFingerprint, tunnelHostProblem, type ResolvedConfig } from '../src/config.ts'
 import { createSession, parseCookieHeader, verifyEnrollment, verifySession, verifyValue, SESSION_COOKIE } from '../src/session-cookie.ts'
-import { StateStore, loadState, loadStateOrCreate } from '../src/state.ts'
+import { StateStore, createState, loadState, loadStateOrCreate } from '../src/state.ts'
 import { ENROLL_TOKEN_TTL_MS, Gateway, LOCAL_PATHS, safeNextPath } from '../src/gateway.ts'
 import { PasskeyService } from '../src/webauthn.ts'
 import { APP_JS } from '../src/pages.ts'
-import { TunnelManager, classifySshFailure, describeForwardFailure, fingerprintMatches, hostKeyFingerprints, portAccepts, type TunnelManagerOptions } from '../src/tunnel.ts'
+import { TunnelManager, classifySshFailure, describeForwardFailure, fingerprintMatches, hostKeyFingerprints, keyRejectedMessage, portAccepts, type TunnelManagerOptions } from '../src/tunnel.ts'
+import { probeTunnel } from '../src/probe.ts'
 import { fuserProbeCommand, killCommand, parseFuserHolders, parseSshdHolders, planRelease, ssProbeCommand } from '../src/remote-release.ts'
 import { toBase64Url } from '../src/encoding.ts'
 import { apply, type ConnectionContext, type PluginContext } from '../src/index.ts'
 import { Config, provenance } from '../src/config.ts'
 import { qrDataUrl } from '../src/qr.ts'
 import {
-  ENROLL_MINT_PATH, PASSKEY_REMOVE_PATH, STATUS_PATH, TRUST_FORGET_PATH, TUNNEL_RELEASE_PATH, TUNNEL_RETRY_PATH, registerRoutes,
+  ENROLL_MINT_PATH, PASSKEY_REMOVE_PATH, STATUS_PATH, TRUST_FORGET_PATH, TUNNEL_RELEASE_PATH, TUNNEL_RETRY_PATH, TUNNEL_TEST_PATH, registerRoutes,
   type FetchRoute, type RouteSource,
 } from '../src/routes.ts'
 import { buildStatus, sshEquivalent } from '../src/status.ts'
@@ -164,6 +165,44 @@ function listen(server: Server): Promise<number> {
 }
 
 /**
+ * Start a throwaway SSH server, so the connection test can be driven end to end
+ * without a VPS.
+ *
+ * ssh2 ships both halves, and the fixture is deliberately the simplest server
+ * that can authenticate somebody: one host key, and an `authentication` handler
+ * that either accepts the offered public key or refuses everything. The
+ * fingerprint it presents is read back from a test rather than from ssh2's
+ * internals.
+ * @param attempt - whether a `publickey` attempt should succeed.
+ * @returns the ephemeral port it listens on and a disposer.
+ */
+async function startSshServer(attempt: boolean): Promise<{ port: number, close(): Promise<void> }> {
+  const { private: privateKey } = ssh2.utils.generateKeyPairSync('ed25519')
+  const server = new ssh2.Server({ hostKeys: [privateKey] }, (client) => {
+    // A probe that aborts mid-handshake (the host-key-mismatch case) makes the
+    // server-side connection emit an error; the fixture has nothing to say about
+    // it, and an unhandled one would take the whole check run down.
+    client.on('error', () => {})
+    client.on('authentication', (context) => {
+      if (attempt && context.method === 'publickey') context.accept()
+      else context.reject(['publickey'])
+    })
+  })
+  server.on('error', () => {})
+  const port = await new Promise<number>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject)
+      resolve((server.address() as AddressInfo).port)
+    })
+  })
+  return {
+    port,
+    close: () => new Promise<void>((resolve) => { server.close(() => { resolve() }) }),
+  }
+}
+
+/**
  * A port to hand to `apply()` as `serverPort`.
  *
  * Deliberately NOT "bind an ephemeral port, close it, reuse the number": that
@@ -225,15 +264,57 @@ function testConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
   }
 }
 
+/** The fingerprint every manager in this file is configured with. */
+const TEST_FINGERPRINT = 'test-fingerprint'
+
 /**
  * Tunnel options whose configuration only carries the tunnel half, which is all
  * the manager reads.
+ *
+ * `fingerprint` is a fixed literal: the gate is about whether the store's proven
+ * list contains it, not about how it was computed.
  * @param overrides - tunnel fields this check cares about.
  * @param local - where the gateway listener is, for connections that land.
  * @returns the options.
  */
 function tunnelOptions(overrides: Partial<ResolvedConfig['tunnel']>, local = { host: '127.0.0.1', port: 1 }): TunnelManagerOptions {
-  return { config: testConfig({ tunnel: { ...testConfig().tunnel, ...overrides } }), local, store: new StateStore(join(process.cwd(), '.selfcheck-tunnel.json')), log: silentLog }
+  return {
+    config: testConfig({ tunnel: { ...testConfig().tunnel, ...overrides } }),
+    fingerprint: TEST_FINGERPRINT,
+    local,
+    store: new StateStore(join(process.cwd(), '.selfcheck-tunnel.json')),
+    log: silentLog,
+  }
+}
+
+/**
+ * Mark the store's configuration as proven, the way a connection test would.
+ * @param store - the loaded state store a manager will read.
+ * @param fingerprint - which configuration to prove; the default is the one
+ * `tunnelOptions` hands out.
+ */
+function verifyTunnel(store: StateStore, fingerprint = TEST_FINGERPRINT): void {
+  store.state.tunnelTests = [{ fingerprint, at: Date.now(), hostKey: null }]
+}
+
+/**
+ * Write the state file one row would have after a successful connection test.
+ *
+ * `apply()` reads the state file from the scoped home, so a check about the
+ * "proven configuration" gate has to publish its proof the same way a real test
+ * does: into that file, before the plugin loads it.
+ * @param home - the scoped home directory the row will use.
+ * @param row - the plugin row's configuration, resolved here exactly as the
+ * plugin resolves it.
+ * @returns the state file path.
+ */
+async function seedVerifiedState(home: string, row: Record<string, unknown>): Promise<string> {
+  const stateFile = join(home, '.dsh', 'dsh-sync-remote', 'state.json')
+  const state = createState()
+  state.tunnelTests = [{ fingerprint: tunnelFingerprint(resolveConfig(row), state.secret), at: Date.now(), hostKey: null }]
+  await mkdir(dirname(stateFile), { recursive: true })
+  await writeFile(stateFile, `${JSON.stringify(state, undefined, 2)}\n`, 'utf8')
+  return stateFile
 }
 
 /** A host context that records what a plugin logged and what it registered. */
@@ -460,6 +541,21 @@ await check('resolveConfig refuses configurations that fail open', () => {
   assert.throws(() => resolveConfig({ publicOrigin: 'https://a.example', tunnel: { enabled: true } }), ConfigError)
   assert.throws(() => resolveConfig({ publicOrigin: 'https://a.example', tunnel: { enabled: true, host: 'vps.example' } }), ConfigError)
   assert.throws(() => resolveConfig({ publicOrigin: 'https://a.example', tunnel: { enabled: 'maybe' } }), ConfigError)
+  // An address that can never be a host is refused as a configuration fault, so
+  // the row opens nothing at all rather than dialing forever on a typo.
+  const typo = {
+    publicOrigin: 'https://a.example',
+    serverPort: 3090,
+    clientPort: 3080,
+    sessionTtlHours: 720,
+    tunnel: { enabled: true, host: '185.201.227.601', port: 22, user: 'root', privateKeyFile: '/k' },
+  }
+  assert.throws(() => resolveConfig(typo), /0–255/u)
+  // A disabled tunnel's host is inert: it must not take the whole row down.
+  assert.equal(
+    resolveConfig({ ...typo, tunnel: { ...typo.tunnel, enabled: false } }).tunnel.enabled,
+    false,
+  )
 })
 
 await check('every value with a box in the settings form is required', () => {
@@ -629,6 +725,9 @@ await check('a disabled tunnel does nothing and a missing key file fails the loa
   await disabled.start()
   assert.equal(disabled.snapshot().state, 'disabled')
 
+  // The key fault is what this check is about, so the configuration is marked
+  // proven first; the gate itself is asserted below.
+  verifyTunnel(disabledStore)
   const missing = new TunnelManager({
     ...tunnelOptions({ enabled: true, user: 'x', privateKeyFile: join(workdir, 'absent-key') }),
     store: disabledStore,
@@ -652,11 +751,192 @@ await check('a PKCS#8 key is named instead of surfacing ssh2 wording', async () 
   await writeFile(keyFile, privateKey, 'utf8')
   const store = new StateStore(join(workdir, 'format-state.json'))
   await store.load()
+  verifyTunnel(store)
   const manager = new TunnelManager({
     ...tunnelOptions({ enabled: true, port: 1, user: 'nobody', privateKeyFile: keyFile }),
     store,
   })
   await assert.rejects(() => manager.start(), /PKCS#8/)
+})
+
+await check('an address that can never be a host is refused before any dial', () => {
+  // Only the shapes a typo produces: everything else is the connection test's
+  // verdict, because "a well-formed address that is not your VPS" is invisible
+  // offline.
+  for (const bad of ['185.201.227.601', '1.2.3.999', 'vps.example.com:22', 'ssh://vps', 'root@vps', '[::1]', 'my vps', 'vps/example']) {
+    assert.ok(tunnelHostProblem(bad) !== null, `${JSON.stringify(bad)} must be refused`)
+  }
+  assert.match(String(tunnelHostProblem('185.201.227.601')), /0–255/)
+  assert.match(String(tunnelHostProblem('vps.example.com:22')), /VPS SSH port/)
+  for (const good of ['203.0.113.10', '::1', 'vps.example.com', 'vps.example.com.', 'vps', 'my_vps', 'localhost']) {
+    assert.equal(tunnelHostProblem(good), null, `${JSON.stringify(good)} must be accepted`)
+  }
+})
+
+await check('a key that cannot be turned into a signer names the field to fix', () => {
+  // The two passphrase faults used to arrive as one "unsupported format"
+  // sentence, which sent the operator to regenerate a perfectly good key.
+  assert.match(keyRejectedMessage('/k', new Error('Encrypted private OpenSSH key detected, but no passphrase given')), /no passphrase is set/)
+  assert.match(keyRejectedMessage('/k', new Error('OpenSSH key integrity check failed -- bad passphrase?')), /passphrase .* is wrong/)
+  assert.match(keyRejectedMessage('/k', new Error('Unsupported key format')), /PKCS#8/)
+})
+
+await check('the fingerprint names exactly the values a connection test proves', () => {
+  /** @param overrides - row fields this check varies. @returns the resolved configuration. */
+  const config = (overrides: Record<string, unknown>): ResolvedConfig => resolveConfig({
+    publicOrigin: 'https://dsh.example.test',
+    serverPort: 3090,
+    clientPort: 3080,
+    sessionTtlHours: 24,
+    tunnel: { enabled: true, host: 'vps.example.com', port: 22, user: 'root', privateKeyFile: '/k/id_ed25519', ...overrides },
+  })
+  const secret = 'c2VjcmV0'
+  const base = config({})
+  const fingerprint = tunnelFingerprint(base, secret)
+  assert.equal(tunnelFingerprint(config({}), secret), fingerprint, 'the same values must produce the same fingerprint')
+  for (const varied of [
+    { host: 'other.example.com' }, { port: 2222 }, { user: 'deploy' },
+    { privateKeyFile: '/k/other' }, { passphrase: 'hunter2' },
+  ]) {
+    assert.notEqual(tunnelFingerprint(config(varied), secret), fingerprint, `${JSON.stringify(varied)} must change the fingerprint`)
+  }
+  // The passphrase never rides in the clear, so it is salted with the state
+  // secret; with no passphrase there is no secret in the identity at all.
+  const secretive = config({ passphrase: 'hunter2' })
+  assert.notEqual(
+    tunnelFingerprint(secretive, 'other-secret'),
+    tunnelFingerprint(secretive, secret),
+    'the passphrase digest is salted with the state secret',
+  )
+  assert.equal(tunnelFingerprint(base, 'other-secret'), fingerprint, 'nothing secret is in the identity without a passphrase')
+  // The values no dial exercises are deliberately outside it: changing them must
+  // not demand a new test.
+  const elsewhere = resolveConfig({
+    publicOrigin: 'https://other.example.test',
+    serverPort: 4090,
+    clientPort: 3081,
+    sessionTtlHours: 24,
+    tunnel: { enabled: true, host: 'vps.example.com', port: 22, user: 'root', privateKeyFile: '/k/id_ed25519' },
+  })
+  assert.equal(tunnelFingerprint(elsewhere, secret), fingerprint)
+})
+
+await check('a proven configuration is remembered, trimmed, and read from older files', async () => {
+  const file = join(workdir, 'ring-state.json')
+  // An older state file has no `tunnelTests` at all: it must read as "nothing has
+  // been proven", not as a file this version cannot load.
+  await writeFile(file, JSON.stringify({
+    version: 1,
+    secret: toBase64Url(randomBytes(32)),
+    statusToken: toBase64Url(randomBytes(24)),
+    userID: toBase64Url(randomBytes(32)),
+    sshHostKey: null,
+    passkeys: [],
+  }), 'utf8')
+  const store = new StateStore(file)
+  await store.load()
+  assert.equal(store.state.tunnelTests.length, 0, 'an older file proves nothing, and loads')
+
+  for (let i = 0; i < 12; i += 1) await store.rememberTunnelTest(`fp-${String(i)}`, null)
+  assert.equal(store.state.tunnelTests.length, 8)
+  assert.equal(store.state.tunnelTests[0]?.fingerprint, 'fp-11')
+  assert.equal(store.state.tunnelTests.some(entry => entry.fingerprint === 'fp-0'), false, 'the oldest entry is the one dropped')
+  // Re-proving the same values refreshes its place instead of duplicating it —
+  // which is what keeps "tested new values, never saved" from un-verifying the
+  // configuration that is actually running.
+  await store.rememberTunnelTest('fp-11', 'SHA256:x')
+  assert.equal(store.state.tunnelTests.filter(entry => entry.fingerprint === 'fp-11').length, 1)
+  assert.equal(store.state.tunnelTests[0]?.hostKey, 'SHA256:x')
+
+  const reloaded = await loadState(file)
+  assert.equal(reloaded.tunnelTests.length, 8)
+  // A hand-edited record fails the load instead of silently counting as proof.
+  await writeFile(file, JSON.stringify({ ...reloaded, tunnelTests: [{ fingerprint: '', at: 1, hostKey: null }] }), 'utf8')
+  await assert.rejects(() => loadState(file), /fingerprint/)
+})
+
+await check('a configuration no connection test has proven is never dialed', async () => {
+  // The gate is the Host half of "test, then persist": a value edited into the
+  // profile by hand never reaches an SSH session.
+  const store = new StateStore(join(workdir, 'untested-state.json'))
+  await store.load()
+  const logged: string[] = []
+  const manager = new TunnelManager({
+    // A key file that does not exist proves the order: the gate is read before
+    // the key is, so the missing file must not be blamed for anything.
+    ...tunnelOptions({ enabled: true, user: 'x', privateKeyFile: join(workdir, 'absent-untested-key') }),
+    store,
+    log: { info: () => {}, warn: line => { logged.push(String(line)) }, error: line => { logged.push(String(line)) } },
+  })
+  await manager.start()
+  const snapshot = manager.snapshot()
+  assert.equal(snapshot.state, 'untested', JSON.stringify(snapshot))
+  assert.equal(snapshot.attempts, 0, 'an unverified configuration never dials')
+  assert.equal(snapshot.nextRetryAt, null, 'and schedules nothing')
+  assert.match(String(snapshot.lastError), /has not been verified/)
+  assert.doesNotMatch(String(snapshot.lastError), /cannot read/, 'the key is never read: the values are the unverified part')
+  assert.ok(logged.some(line => line.includes('has not been verified')), logged.join('\n'))
+  // Waiting on it cannot change a terminal state, so a caller is answered at once.
+  assert.equal(await manager.waitForListening(5_000), 'untested')
+
+  // The same manager, once the store holds the fingerprint a test would record:
+  // it now proceeds to the key, and only the missing file stops it.
+  verifyTunnel(store)
+  await assert.rejects(() => manager.start(), /cannot read the SSH private key/)
+})
+
+await check('the connection test authenticates, compares the pin, and never writes it', async () => {
+  const { private: openSshKey } = ssh2.utils.generateKeyPairSync('ed25519')
+  const keyFile = join(workdir, 'id_ed25519-probe')
+  await writeFile(keyFile, openSshKey, 'utf8')
+  const tunnel = (overrides: Partial<ResolvedConfig['tunnel']>): ResolvedConfig['tunnel'] =>
+    ({ ...testConfig().tunnel, enabled: true, host: '127.0.0.1', user: 'root', privateKeyFile: keyFile, ...overrides })
+
+  const accepting = await startSshServer(true)
+  try {
+    const passed = await probeTunnel({ config: tunnel({ port: accepting.port }), pin: null, log: silentLog })
+    assert.equal(passed.ok, true, JSON.stringify(passed))
+    assert.match(String(passed.hostKey), /^SHA256:/)
+
+    // The pin is compared, not created: the same fingerprint passes…
+    const trusted = await probeTunnel({ config: tunnel({ port: accepting.port }), pin: passed.hostKey, log: silentLog })
+    assert.equal(trusted.ok, true, JSON.stringify(trusted))
+    // …and a different one fails with the fact, which is what the page needs to
+    // tell "your VPS was re-installed" from "this is not your VPS".
+    const foreign = hostKeyFingerprints(randomBytes(32)).base64
+    const mismatched = await probeTunnel({ config: tunnel({ port: accepting.port }), pin: foreign, log: silentLog })
+    assert.equal(mismatched.ok, false)
+    assert.equal(mismatched.kind, 'host-key')
+    assert.match(String(mismatched.reason), /does not match the trusted/)
+
+    // A refused socket is classified exactly as the tunnel classifies it.
+    const refused = await probeTunnel({ config: tunnel({ port: 1 }), pin: null, log: silentLog })
+    assert.equal(refused.ok, false)
+    assert.equal(refused.kind, 'unreachable')
+
+    // An impossible address never reaches the network at all.
+    const impossible = await probeTunnel({ config: tunnel({ host: '185.201.227.601' }), pin: null, log: silentLog })
+    assert.equal(impossible.ok, false)
+    assert.match(String(impossible.reason), /0–255/)
+
+    // A key file that is not there is named, not dialed.
+    const absent = await probeTunnel({ config: tunnel({ privateKeyFile: join(workdir, 'absent-probe-key') }), pin: null, log: silentLog })
+    assert.equal(absent.kind, 'key')
+    assert.match(String(absent.reason), /cannot read the SSH private key/)
+  } finally {
+    await accepting.close()
+  }
+
+  // The same fixture, refusing every identity: the test must say `auth`, which is
+  // the field-level answer for "the user or the key authorization is wrong".
+  const refusing = await startSshServer(false)
+  try {
+    const denied = await probeTunnel({ config: tunnel({ port: refusing.port }), pin: null, log: silentLog })
+    assert.equal(denied.ok, false)
+    assert.equal(denied.kind, 'auth', JSON.stringify(denied))
+  } finally {
+    await refusing.close()
+  }
 })
 
 await check('a refused connection is retried instead of failing the plugin', async () => {
@@ -667,6 +947,7 @@ await check('a refused connection is retried instead of failing the plugin', asy
   await writeFile(keyFile, openSshKey, 'utf8')
   const store = new StateStore(join(workdir, 'retry-state.json'))
   await store.load()
+  verifyTunnel(store)
   const manager = new TunnelManager({
     ...tunnelOptions({ enabled: true, port: 1, user: 'nobody', privateKeyFile: keyFile }),
     store,
@@ -744,6 +1025,7 @@ await check('repeated failures that never once succeeded are called a configurat
   await writeFile(keyFile, openSshKey, 'utf8')
   const store = new StateStore(join(workdir, 'escalation-state.json'))
   await store.load()
+  verifyTunnel(store)
   // What the tunnel logged, so the throttling is asserted rather than described.
   const logged: string[] = []
   const capturing: Logger = {
@@ -774,7 +1056,7 @@ await check('repeated failures that never once succeeded are called a configurat
     const lost = logged.filter(line => line.includes('tunnel lost'))
     assert.ok(lost.length <= 3, `${String(lost.length)} lines for ${String(snapshot.attempts)} attempts:\n${logged.join('\n')}`)
     assert.ok(lost.length >= 1, `a failure must still be reported once:\n${logged.join('\n')}`)
-    assert.ok(lost.some(line => line.includes('looks like a configuration problem')), logged.join('\n'))
+    assert.ok(lost.some(line => line.includes('retrying as a network/VPS condition')), logged.join('\n'))
   } finally {
     await manager.stop()
   }
@@ -789,6 +1071,7 @@ await check('a retry after a failure forgets the previous reason instead of pres
   await writeFile(keyFile, openSshKey, 'utf8')
   const store = new StateStore(join(workdir, 'retry-clear-state.json'))
   await store.load()
+  verifyTunnel(store)
   const manager = new TunnelManager({
     ...tunnelOptions({ enabled: true, port: 1, user: 'nobody', privateKeyFile: keyFile, reconnectMaxDelayMs: 20, suspectedReconnectMaxDelayMs: 20 }),
     store,
@@ -828,6 +1111,7 @@ await check('a stopped tunnel starts again instead of staying dead', async () =>
   await writeFile(keyFile, openSshKey, 'utf8')
   const store = new StateStore(join(workdir, 'restart-state.json'))
   await store.load()
+  verifyTunnel(store)
   const manager = new TunnelManager({
     ...tunnelOptions({ enabled: true, port: 1, user: 'nobody', privateKeyFile: keyFile }),
     store,
@@ -1434,6 +1718,7 @@ await check('the settings routes answer JSON and refuse bad writes', async () =>
   let forgotten = 0
   let retried = 0
   let released = 0
+  let tested = 0
   const source: RouteSource = {
     status: () => buildStatus({
       configured: true, resolved: null, sources: {}, configError: 'publicOrigin is not an absolute URL',
@@ -1461,11 +1746,18 @@ await check('the settings routes answer JSON and refuse bad writes', async () =>
       released += 1
       return { ok: true, detail: 'ended sshd pid(s) 1234' }
     },
+    testTunnel: async (patch) => {
+      tested += 1
+      if (patch.host === '185.201.227.601') {
+        return { ok: false, reason: 'the VPS address "185.201.227.601" is not a valid IPv4 address; each of its four parts must be 0–255' }
+      }
+      return { ok: true, hostKey: 'SHA256:presented', verifiedAt: 1, restarted: false }
+    },
   }
   registerRoutes({ register: (route) => { registered.push(route) } }, source, silentLog)
   assert.deepEqual(
     registered.map(route => route.path).sort(),
-    [STATUS_PATH, PASSKEY_REMOVE_PATH, ENROLL_MINT_PATH, TRUST_FORGET_PATH, TUNNEL_RETRY_PATH, TUNNEL_RELEASE_PATH].sort(),
+    [STATUS_PATH, PASSKEY_REMOVE_PATH, ENROLL_MINT_PATH, TRUST_FORGET_PATH, TUNNEL_RETRY_PATH, TUNNEL_TEST_PATH, TUNNEL_RELEASE_PATH].sort(),
   )
   const statusRoute = registered.find(route => route.path === STATUS_PATH)
   const removeRoute = registered.find(route => route.path === PASSKEY_REMOVE_PATH)
@@ -1520,6 +1812,26 @@ await check('the settings routes answer JSON and refuse bad writes', async () =>
   // would be unauditable.
   assert.match(JSON.stringify(await release.json()), /ended sshd pid\(s\) 1234/)
 
+  // The connection test: a proven candidate comes back 200, a failure is a 409
+  // the page renders, and a malformed patch is the caller's 400 — never a 500.
+  const testRoute = registered.find(route => route.path === TUNNEL_TEST_PATH)
+  assert.ok(testRoute !== undefined)
+  const test = (value: unknown): Promise<Response> => testRoute.fetch(new Request(`https://dsh.example.test${TUNNEL_TEST_PATH}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: typeof value === 'string' ? value : JSON.stringify(value),
+  }))
+  const passed = await test({ host: '203.0.113.10' })
+  assert.equal(passed.status, 200)
+  assert.equal(passed.headers.get('cache-control'), 'no-store')
+  assert.match(JSON.stringify(await passed.json()), /SHA256:presented/)
+  const failed = await test({ host: '185.201.227.601' })
+  assert.equal(failed.status, 409)
+  assert.match(JSON.stringify(await failed.json()), /0–255/)
+  assert.equal((await test({ port: 'twenty-two' })).status, 400, 'a patch carries real types or it is refused')
+  assert.equal((await test('not json')).status, 400)
+  assert.equal(tested, 2)
+
   const failing: RouteSource = {
     status: () => { throw new Error('boom') },
     removePasskey: async () => ({ ok: true }),
@@ -1527,6 +1839,7 @@ await check('the settings routes answer JSON and refuse bad writes', async () =>
     forgetHostKey: async () => ({ ok: false, reason: 'nothing is pinned' }),
     retryTunnel: async () => ({ ok: false, reason: 'the GUI refuses this authority' }),
     releaseStaleForward: async () => ({ ok: false, reason: 'unavailable: this row does not allow it' }),
+    testTunnel: async () => ({ ok: false, reason: 'the VPS address "vps.invalid" could not be resolved' }),
   }
   const captured: FetchRoute[] = []
   registerRoutes({ register: (route) => { captured.push(route) } }, failing, silentLog)
@@ -1550,6 +1863,14 @@ await check('the settings routes answer JSON and refuse bad writes', async () =>
   const refusedRelease = await failingRelease.fetch(new Request(`https://x${TUNNEL_RELEASE_PATH}`, { method: 'POST' }))
   assert.equal(refusedRelease.status, 409, 'a release the row does not allow is a refusal, not a server error')
   assert.match(JSON.stringify(await refusedRelease.json()), /does not allow it/)
+
+  const failingTest = captured.find(route => route.path === TUNNEL_TEST_PATH)
+  assert.ok(failingTest !== undefined)
+  const refusedTest = await failingTest.fetch(new Request(`https://x${TUNNEL_TEST_PATH}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ host: 'vps.invalid' }),
+  }))
+  assert.equal(refusedTest.status, 409, 'a failed test is a state the page renders, not a server error')
+  assert.match(JSON.stringify(await refusedTest.json()), /could not be resolved/)
 })
 
 await check('apply() boots the gateway and mints one first-run enrollment link', async () => {
@@ -1786,7 +2107,7 @@ await check('apply() stays idle when no public origin is configured', async () =
     assert.equal(effects.length, 0)
     connect()
     assert.deepEqual(routes.map(route => route.path).sort(),
-      [STATUS_PATH, PASSKEY_REMOVE_PATH, ENROLL_MINT_PATH, TRUST_FORGET_PATH, TUNNEL_RETRY_PATH, TUNNEL_RELEASE_PATH].sort(),
+      [STATUS_PATH, PASSKEY_REMOVE_PATH, ENROLL_MINT_PATH, TRUST_FORGET_PATH, TUNNEL_RETRY_PATH, TUNNEL_TEST_PATH, TUNNEL_RELEASE_PATH].sort(),
       'the settings routes are registered even while nothing serves')
     assert.ok(lines.some(line => line.includes('public access stays off')), lines.join('\n'))
     // Nothing serves yet, so there is no local entry line to add either.
@@ -1861,7 +2182,7 @@ await check('apply() wires the settings routes and the sign-in redirect to a con
     )
     assert.deepEqual(authBases, [`http://127.0.0.1:${String(upstreamPort)}/`])
     assert.deepEqual(routes.map(route => route.path).sort(),
-      [STATUS_PATH, PASSKEY_REMOVE_PATH, ENROLL_MINT_PATH, TRUST_FORGET_PATH, TUNNEL_RETRY_PATH, TUNNEL_RELEASE_PATH].sort())
+      [STATUS_PATH, PASSKEY_REMOVE_PATH, ENROLL_MINT_PATH, TRUST_FORGET_PATH, TUNNEL_RETRY_PATH, TUNNEL_TEST_PATH, TUNNEL_RELEASE_PATH].sort())
     // This instance has its own state file (its own home), so its session is
     // minted from that secret rather than the main harness one.
     const ownSecret = (await loadState(join(home, '.dsh', 'dsh-sync-remote', 'state.json'))).secret
@@ -2110,40 +2431,74 @@ await check('a refused fence closes the tunnel before it ever opens', async () =
   }
 })
 
-await check('an accepting fence still opens the tunnel', async () => {
-  // The other half of the contract: the gate must not become a way to keep a
+await check('an accepting fence opens the tunnel only once a test has proven the values', async () => {
+  // The other half of the contract: the gates must not become a way to keep a
   // correctly launched deployment down. The stand-in upstream answers `/api`
   // with 401, which is what a fence that accepts the Host says.
   const freePort = await serverPortForTest()
   const home = join(workdir, 'home-fence-accepted')
+  const row = {
+    publicOrigin: 'https://dsh.example.test',
+    serverPort: freePort,
+    clientPort: upstreamPort,
+    sessionTtlHours: 24,
+    // A closed port and a missing key: even if a future edit did open the tunnel
+    // here, this fixture could not reach anything.
+    tunnel: { enabled: true, host: '127.0.0.1', port: 1, user: 'root', privateKeyFile: join(home, 'absent-key') },
+  }
   const { context, lines, effects, release } = harnessContext()
   /** @returns whether the captured console carries `text`. */
   const printed = (text: string): boolean => lines.some(line => line.includes(text))
   try {
+    // (a) Nobody has proven this configuration: the fence accepts, and the row
+    // still dials nothing and binds nothing — the key is not even read.
     await withEnv({ USERPROFILE: home, HOME: home }, async () => {
-      await apply(context, {
-        publicOrigin: 'https://dsh.example.test',
-        serverPort: freePort,
-        clientPort: upstreamPort,
-        sessionTtlHours: 24,
-        tunnel: { enabled: true, host: '127.0.0.1', port: 1, user: 'root', privateKeyFile: join(home, 'absent-key') },
-      })
+      await apply(context, row)
     })
     assert.ok(
-      await until(() => printed('cannot read the SSH private key')),
-      `the tunnel must be started once the fence accepts:\n${lines.join('\n')}`,
+      await until(() => printed('has not been verified')),
+      `an unproven configuration must say so:\n${lines.join('\n')}`,
     )
     assert.equal(printed('the reverse tunnel stays closed'), false, lines.join('\n'))
-    // The other half of the same rule: an accepted fence binds the listener before
-    // the tunnel dials, because the tunnel's only job is to hand connections here.
+    assert.equal(printed('cannot read the SSH private key'), false, `no key may be read before the values are proven:\n${lines.join('\n')}`)
     assert.equal(
-      await portAccepts('127.0.0.1', freePort, 1_000),
-      true,
-      'the gateway must be listening once the fence accepts this Host',
+      await portAccepts('127.0.0.1', freePort, 500),
+      false,
+      'an unverified configuration must leave the gateway unbound too',
     )
   } finally {
     for (const dispose of effects) await dispose()
     release()
+  }
+
+  // (b) The same row, with the state file a successful test would have written:
+  // now it dials — and the listener still does not appear until the session
+  // authenticates, which a missing key can never do.
+  const verifiedHome = join(workdir, 'home-fence-verified')
+  await withEnv({ USERPROFILE: verifiedHome, HOME: verifiedHome }, async () => {
+    await seedVerifiedState(verifiedHome, {
+      ...row,
+      tunnel: { ...row.tunnel, privateKeyFile: join(verifiedHome, 'absent-key') },
+    })
+  })
+  const second = harnessContext()
+  try {
+    await withEnv({ USERPROFILE: verifiedHome, HOME: verifiedHome }, async () => {
+      await apply(second.context, { ...row, tunnel: { ...row.tunnel, privateKeyFile: join(verifiedHome, 'absent-key') } })
+    })
+    assert.ok(
+      await until(() => second.lines.some(line => line.includes('cannot read the SSH private key'))),
+      `a proven configuration must be dialed:\n${second.lines.join('\n')}`,
+    )
+    assert.equal(second.lines.some(line => line.includes('has not been verified')), false, second.lines.join('\n'))
+    assert.equal(
+      await portAccepts('127.0.0.1', freePort, 500),
+      false,
+      'the listener waits for an authenticated session, not for the fence',
+    )
+  } finally {
+    for (const dispose of second.effects) await dispose()
+    second.release()
   }
 })
 
@@ -2178,9 +2533,12 @@ await check('an indeterminate fence answer is re-asked before it blocks', async 
         tunnel: { enabled: true, host: '127.0.0.1', port: 1, user: 'root', privateKeyFile: join(home, 'absent-key') },
       })
     })
+    // A 401 on the third ask is the fence accepting: the row moves on to its own
+    // gate, which — with nothing proven yet — is `untested`. Reading the key is
+    // not the proof any more; reaching the configuration gate is.
     assert.ok(
-      await until(() => printed('cannot read the SSH private key'), 5_000),
-      `a 404 that turns into a 401 must still open the tunnel:\n${lines.join('\n')}`,
+      await until(() => printed('has not been verified'), 5_000),
+      `a 404 that turns into a 401 must still open the tunnel's own path:\n${lines.join('\n')}`,
     )
     assert.ok(asked >= 3, `the first 404s must be re-asked, not taken as final (asked ${String(asked)})`)
     assert.equal(printed('the reverse tunnel stays closed'), false, lines.join('\n'))
@@ -2313,7 +2671,7 @@ await check('the client bundle names exactly the Host routes that exist', async 
   // connects the two, so this is what connects them: rename a route on one side
   // and the settings page would 404 in silence.
   const bundle = await readFile(join(process.cwd(), 'lib/client.js'), 'utf8')
-  const declared = new Set([STATUS_PATH, ENROLL_MINT_PATH, PASSKEY_REMOVE_PATH, TRUST_FORGET_PATH, TUNNEL_RETRY_PATH, TUNNEL_RELEASE_PATH])
+  const declared = new Set([STATUS_PATH, ENROLL_MINT_PATH, PASSKEY_REMOVE_PATH, TRUST_FORGET_PATH, TUNNEL_RETRY_PATH, TUNNEL_TEST_PATH, TUNNEL_RELEASE_PATH])
   const named = new Set([...bundle.matchAll(/\/api\/sync-remote\.[A-Za-z.]+/gu)].map(match => match[0]))
   assert.ok(named.size >= declared.size, `the bundle should talk to every route: ${[...named].join(', ')}`)
   for (const route of named) {

@@ -82,6 +82,7 @@ export type TunnelFailureKind =
   | 'unreachable'
   | 'handshake-timeout'
   | 'forward-refused'
+  | 'local'
   | 'dropped'
   | 'unknown'
 
@@ -116,6 +117,33 @@ export function describeForwardFailure(bindPort: number, message: string): strin
 }
 
 /**
+ * The sentence for a private key ssh2 could not turn into a signing key.
+ *
+ * The distinction matters because the two cases point at different fields: an
+ * encrypted key with no passphrase and a wrong passphrase are both the
+ * passphrase's problem, while everything else — the PKCS#8 PEM openssl writes, a
+ * truncated file — is the file's. ssh2 reports them through the same synchronous
+ * throw, so this message is the only classification available, and the
+ * connection test and the tunnel's own dial share it.
+ * @param file - the configured key path.
+ * @param error - what ssh2 threw while parsing the key.
+ * @returns one actionable sentence.
+ */
+export function keyRejectedMessage(file: string, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  const lower = message.toLowerCase()
+  if (lower.includes('no passphrase given')) {
+    return `dsh-sync-remote: the private key ${JSON.stringify(file)} is encrypted, but no passphrase is set (${message}); fill in 「私钥口令 / Key passphrase」 in Settings → Remote access`
+  }
+  if (lower.includes('bad passphrase')) {
+    return `dsh-sync-remote: the passphrase for the private key ${JSON.stringify(file)} is wrong (${message}); correct 「私钥口令 / Key passphrase」 in Settings → Remote access`
+  }
+  return `dsh-sync-remote: the private key ${JSON.stringify(file)} was rejected (${message}); `
+    + 'ssh2 reads the OpenSSH format ssh-keygen writes by default, plus PKCS#1 and SEC1 PEM, but not a PKCS#8 "BEGIN PRIVATE KEY" file — '
+    + 're-export or regenerate this key, for example with: ssh-keygen -t ed25519 -f <file>'
+}
+
+/**
  * Lifecycle of the tunnel, as the status endpoint reports it.
  *
  * `blocked` is the one state this manager never reaches on its own: the
@@ -123,8 +151,13 @@ export function describeForwardFailure(bindPort: number, message: string): strin
  * GUI's browser-trust fence refuses the public authority), so no SSH session is
  * ever attempted and nothing is listening on the VPS. It is terminal until the
  * plugin row is loaded again — see `block()`.
+ *
+ * `untested` is the other deliberate refusal: the current configuration has
+ * never passed a connection test, so the values may have been edited in the
+ * profile by hand. Nothing is dialed and nothing is bound; the settings page's
+ * 「测试连接」 is the way out. See `refuseUntested()`.
  */
-export type TunnelState = 'disabled' | 'starting' | 'connecting' | 'reconnecting' | 'listening' | 'failed' | 'stopped' | 'blocked'
+export type TunnelState = 'disabled' | 'starting' | 'connecting' | 'reconnecting' | 'listening' | 'failed' | 'stopped' | 'blocked' | 'untested'
 
 /** Both spellings of one host key's SHA-256 fingerprint. */
 export interface HostKeyFingerprints {
@@ -193,8 +226,28 @@ export interface TunnelSnapshot {
 /** Everything the tunnel needs from its host. */
 export interface TunnelManagerOptions {
   config: ResolvedConfig
+  /**
+   * Identity of the configuration, computed by the composition with
+   * `tunnelFingerprint`.
+   *
+   * A configuration that does not appear in the state file's proven list is
+   * never dialed: it may have been edited in the profile by hand, and the only
+   * thing that makes those values trustworthy is a connection test that reached
+   * the VPS with exactly them.
+   */
+  fingerprint: string
   /** Where accepted connections land: this plugin's own gateway listener. */
   local: { host: string; port: number }
+  /**
+   * Bring the local gateway listener up, once an SSH session is authenticated
+   * and before the remote forward is requested.
+   *
+   * Called at that moment rather than before dialing on purpose: a listener that
+   * exists while the SSH connection is failing serves nothing and reads as a
+   * healthy deployment on the settings page. Failure is terminal — no forward is
+   * ever requested, so the VPS never listens in front of a closed port.
+   */
+  ensureLocal?: (() => Promise<{ ok: true } | { ok: false; message: string }>) | undefined
   store: StateStore
   log: Logger
   onStatus?: (() => void) | undefined
@@ -232,6 +285,8 @@ export function fingerprintMatches(configured: string, presented: HostKeyFingerp
  */
 export class TunnelManager {
   private readonly config: ResolvedConfig['tunnel']
+  private readonly fingerprint: string
+  private readonly ensureLocal: (() => Promise<{ ok: true } | { ok: false; message: string }>) | undefined
   private readonly local: { host: string; port: number }
   private readonly log: Logger
   private readonly store: StateStore
@@ -245,6 +300,15 @@ export class TunnelManager {
   private privateKey: Buffer | null
   private timer: NodeJS.Timeout | null
   private stopped: boolean
+  /**
+   * Whether the session being closed has already been failed on purpose.
+   *
+   * The local-listener failure ends the session from inside `forward()`, and the
+   * `close` that follows must not be mistaken for a dropped connection: without
+   * this, the retry loop would dial the VPS again for a fault that only an
+   * operator can clear.
+   */
+  private fatal: boolean
   /**
    * Bumped by every `connect()` and every `stop()`.
    *
@@ -275,6 +339,8 @@ export class TunnelManager {
    */
   constructor(options: TunnelManagerOptions) {
     this.config = options.config.tunnel
+    this.fingerprint = options.fingerprint
+    this.ensureLocal = options.ensureLocal
     // Where the forwarded connections land: this plugin's own gateway listener.
     this.local = options.local
     this.log = options.log
@@ -289,6 +355,7 @@ export class TunnelManager {
     this.privateKey = null
     this.timer = null
     this.stopped = false
+    this.fatal = false
     this.portHinted = false
     this.generation = 0
     this.hostKeyRejected = null
@@ -337,10 +404,12 @@ export class TunnelManager {
    * @returns the state observed, never rejects.
    */
   waitForListening(timeoutMs: number): Promise<TunnelState> {
-    // `blocked` joins the terminal states: waiting cannot change it, only a new
-    // plugin load can, and a caller parked here would otherwise sit out the whole
-    // timeout for an answer already known.
-    if (this.state === 'listening' || this.state === 'failed' || this.state === 'disabled' || this.state === 'blocked') {
+    // `blocked` and `untested` join the terminal states: waiting cannot change
+    // them, only a new plugin load (or a connection test) can, and a caller
+    // parked here would otherwise sit out the whole timeout for an answer
+    // already known.
+    if (this.state === 'listening' || this.state === 'failed' || this.state === 'disabled'
+      || this.state === 'blocked' || this.state === 'untested') {
       return Promise.resolve(this.state)
     }
     return new Promise<TunnelState>((resolve) => {
@@ -380,6 +449,7 @@ export class TunnelManager {
     // permanently stopped while reporting no error at all. The failure kind and its
     // text go too: a fresh attempt must not present the previous attempt's reason.
     this.stopped = false
+    this.fatal = false
     this.attempts = 0
     this.kind = null
     this.announcedKind = null
@@ -388,6 +458,14 @@ export class TunnelManager {
     if (!this.config.enabled) {
       this.setState('disabled')
       this.log.info('dsh-sync-remote: the reverse tunnel is disabled (set tunnel.host, tunnel.user, and tunnel.privateKeyFile to enable it)')
+      return
+    }
+    // The gate sits before the key is even read: a configuration nobody has
+    // proven must not dial, and it must not report a key fault either — the
+    // values themselves are what is unverified. Only a connection test from the
+    // settings page records the fingerprint that opens this door.
+    if (!this.store.state.tunnelTests.some(entry => entry.fingerprint === this.fingerprint)) {
+      this.refuseUntested()
       return
     }
     try {
@@ -403,10 +481,26 @@ export class TunnelManager {
     try {
       this.connect()
     } catch (error) {
-      const message = `dsh-sync-remote: the private key ${String(this.config.privateKeyFile)} was rejected (${error instanceof Error ? error.message : String(error)})`
+      // ssh2 parses the key synchronously, so a bad key is a throw here rather
+      // than an event — including a key whose passphrase is missing or wrong.
+      const message = keyRejectedMessage(this.config.privateKeyFile as string, error)
       this.fail('key', message)
       throw new Error(message)
     }
+  }
+
+  /**
+   * Refuse to dial a configuration no connection test has proven.
+   *
+   * Terminal by design, and not a failure: the values may be perfectly good,
+   * nobody has shown it yet. The state exists for the settings page, which is
+   * the only surface that can run the test.
+   */
+  private refuseUntested(): void {
+    const message = 'dsh-sync-remote: this tunnel configuration has not been verified with a test connection; open Settings → Remote access and press 「测试连接」 — the public entry stays closed'
+    this.lastError = message
+    this.setState('untested')
+    this.log.warn(message)
   }
 
   /**
@@ -467,7 +561,7 @@ export class TunnelManager {
     client.on('ready', () => {
       if (generation !== this.generation) return
       this.log.info(`dsh-sync-remote: SSH session to ${this.config.user}@${this.config.host}:${String(this.config.port)} is up`)
-      this.forward(client)
+      void this.forward(client)
     })
 
     client.on('tcp connection', (info, accept, reject) => {
@@ -522,6 +616,12 @@ export class TunnelManager {
       if (generation !== this.generation) return
       if (this.stopped) return
       this.client = null
+      if (this.fatal) {
+        // The failure was decided in `forward()`: this close is its consequence,
+        // not a dropped connection to reconnect to.
+        this.fatal = false
+        return
+      }
       const fatal = this.hostKeyRejected
       if (fatal !== null) {
         // Two very different deployment mistakes used to share one sentence. A
@@ -555,16 +655,10 @@ export class TunnelManager {
         hostVerifier: (key: Buffer) => this.verifyHostKey(key),
       })
     } catch (error) {
-      // ssh2 parses the key synchronously and reads the OpenSSH format
-      // `ssh-keygen` writes, PKCS#1 (`BEGIN RSA PRIVATE KEY`), SEC1
-      // (`BEGIN EC PRIVATE KEY`), and PuTTY's PPK — but not the PKCS#8
-      // `BEGIN PRIVATE KEY` PEM that openssl and some exporters emit. Name the
-      // file and the fix instead of surfacing ssh2's own wording.
-      throw new Error(
-        `dsh-sync-remote: the private key ${String(this.config.privateKeyFile)} was rejected (${error instanceof Error ? error.message : String(error)}); `
-        + 'ssh2 reads the OpenSSH format ssh-keygen writes by default, plus PKCS#1 and SEC1 PEM, but not a PKCS#8 "BEGIN PRIVATE KEY" file — '
-        + 're-export or regenerate this key, for example with: ssh-keygen -t ed25519 -f <file>',
-      )
+      // ssh2 parses the key synchronously: an unsupported format, a truncated
+      // file, a missing passphrase and a wrong passphrase all land here, and
+      // `keyRejectedMessage` says which field to look at.
+      throw new Error(keyRejectedMessage(this.config.privateKeyFile as string, error))
     }
   }
 
@@ -601,10 +695,34 @@ export class TunnelManager {
 
   /**
    * Ask the remote server to listen and route its connections here.
+   *
+   * The local listener is brought up first, at this moment rather than before
+   * dialing: a listener that exists while the SSH connection is still failing
+   * serves nothing, and the settings page would report a healthy gateway in
+   * front of a dead tunnel. Binding here keeps the promise that matters — the
+   * remote forward never points at a closed port — while letting a session that
+   * cannot authenticate leave no listener behind at all.
    * @param client - the ready SSH client.
    */
-  forward(client: Client): void {
+  async forward(client: Client): Promise<void> {
     const { remoteHost, remotePort } = this.config
+    if (this.ensureLocal !== undefined) {
+      const generation = this.generation
+      const ready = await this.ensureLocal()
+      if (generation !== this.generation) return
+      if (!ready.ok) {
+        // Terminal on purpose: a port that cannot be bound needs an operator
+        // (change the port, or free it), and retrying would only dial the VPS
+        // again for a forward that is never requested.
+        this.kind = 'local'
+        this.lastError = ready.message
+        this.fatal = true
+        this.fail('local', ready.message)
+        this.log.error(`dsh-sync-remote: the local gateway listener did not start, so no remote forward was requested: ${ready.message}`)
+        client.end()
+        return
+      }
+    }
     client.forwardIn(remoteHost, remotePort, (error, boundPort) => {
       if (error !== undefined && error !== null) {
         // The one failure whose cause is on the VPS: a port a previous session
@@ -816,11 +934,13 @@ export class TunnelManager {
   /** Arm the next connection attempt with capped, jittered exponential backoff. */
   scheduleReconnect(): void {
     this.attempts += 1
-    // A deployment that has never once come up is more likely misconfigured than
-    // unlucky, so past the threshold the ceiling rises: a wrong port stops hammering
-    // the VPS while a VPS that later comes back is still picked up. `everListening`
-    // keeps a tunnel that worked a minute ago on the fast cadence — that one is a
-    // reboot, and waiting five minutes for it would be wrong.
+    // Past the threshold on a deployment that has never once come up, the
+    // ceiling rises so a slow recovery does not hammer the VPS every minute.
+    // This used to be phrased as "probably a typo", which is no longer the right
+    // reading: a configuration only ever dials after a connection test proved it,
+    // so a prolonged failure means the VPS or the network, not the values.
+    // `everListening` keeps a tunnel that worked a minute ago on the fast cadence
+    // — that one is a reboot, and waiting five minutes for it would be wrong.
     const suspected = !this.everListening && this.attempts >= ESCALATE_AFTER_ATTEMPTS
     const ceiling = Math.min(
       suspected ? this.config.suspectedReconnectMaxDelayMs : this.config.reconnectMaxDelayMs,
@@ -833,7 +953,7 @@ export class TunnelManager {
     // changes or every tenth attempt: the console is for what a human must act on,
     // and forty identical lines are not that. The settings page carries the rest.
     if (this.attempts === 1 || this.kind !== this.announcedKind || this.attempts % LOG_EVERY_ATTEMPTS === 0) {
-      const progress = this.attempts === 1 ? '' : ` (attempt ${String(this.attempts)}${suspected ? ', looks like a configuration problem' : ''})`
+      const progress = this.attempts === 1 ? '' : ` (attempt ${String(this.attempts)}${suspected ? ', retrying as a network/VPS condition' : ''})`
       this.log.warn(`dsh-sync-remote: tunnel lost (${this.lastError ?? 'no error reported'}); reconnecting in ${String(delay)} ms${progress}`)
       this.announcedKind = this.kind
     }

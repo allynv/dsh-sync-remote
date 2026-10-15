@@ -2,6 +2,10 @@ node_modules/
 .npm-cache/
 .pnpm-store/
 .selfcheck/
+# The self-check suite makes one `.selfcheck-<random>/` directory per run and
+# removes it on the way out; an interrupted run leaves it behind, and without this
+# line the next `git add -A` would commit its fixtures (`broken.json`, key files).
+.selfcheck-*/
 *.log
 
 # Build output: `npm run build` produces these from src/app.ts and src/client.ts.
