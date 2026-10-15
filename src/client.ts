@@ -244,6 +244,8 @@ window.__ModuleLoader__.load({
       fenceBad: '该 Host 被拒绝：给 dsh web 加 --trusted-host',
       tunnelFailed: '隧道没建立起来：',
       tunnelFailedHint: '上面是 ssh2 报的原始原因（例如 ECONNREFUSED 表示主机/端口不对）。改完保存即可重试。',
+      tunnelBlocked: '隧道没有开启：DSH 的信任围栏不接受这个域名。',
+      tunnelBlockedHint: '用 dsh --profile web --public-url <公网地址>/ --trusted-host <域名> 重启 DSH 即可。在它接受之前，公网入口不会打开（不是故障，是刻意不开）。',
       groupBasic: '基本',
       groupTunnel: 'SSH 反向隧道',
       infoTitle: '固定值（不可修改）',
@@ -328,6 +330,8 @@ window.__ModuleLoader__.load({
       fenceBad: 'that Host is refused: start dsh web with --trusted-host',
       tunnelFailed: 'The tunnel is not up:',
       tunnelFailedHint: 'That is ssh2\u2019s own reason (ECONNREFUSED usually means the host or port is wrong). Fix it and save to retry.',
+      tunnelBlocked: 'The tunnel is closed: the DSH trust fence refuses this Host.',
+      tunnelBlockedHint: 'Restart DSH as dsh --profile web --public-url <public origin>/ --trusted-host <host>. Until it accepts this Host, the public entry point stays closed \u2014 deliberately, not by accident.',
       groupBasic: 'Basics',
       groupTunnel: 'SSH reverse tunnel',
       infoTitle: 'Fixed values (not editable)',
@@ -899,7 +903,18 @@ window.__ModuleLoader__.load({
         // A tunnel that keeps retrying is the one failure the page used to hide:
         // the state line said "reconnecting", and the reason only reached the
         // console the operator is not looking at.
-        if (status !== null && status.runtime.tunnel !== null && status.runtime.tunnel.state !== 'listening'
+        //
+        // `blocked` is the one state with a reason of its own kind: nothing was
+        // attempted and nothing is wrong with the tunnel, so it gets its own
+        // sentence and never the ssh2 hint that would send the operator looking
+        // at ports and keys instead of at the `dsh web` invocation.
+        if (status !== null && status.runtime.tunnel !== null && status.runtime.tunnel.state === 'blocked') {
+          banners.push(h('div', { className: 'sr-banner error', key: 'blocked' }, [
+            h('div', null, t('tunnelBlocked')),
+            h('code', null, status.runtime.tunnel.lastError ?? ''),
+            h('div', { className: 'sr-hint' }, t('tunnelBlockedHint')),
+          ]))
+        } else if (status !== null && status.runtime.tunnel !== null && status.runtime.tunnel.state !== 'listening'
           && status.runtime.tunnel.lastError !== null) {
           banners.push(h('div', { className: 'sr-banner error', key: 'tunnel' }, [
             h('div', null, t('tunnelFailed')),

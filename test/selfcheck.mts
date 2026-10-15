@@ -1837,6 +1837,150 @@ await check('the fence probe waits for boot instead of racing it', async () => {
   }
 })
 
+await check('a refused fence closes the tunnel before it ever opens', async () => {
+  // The bug this check exists for: the tunnel used to be requested before the
+  // fence was asked, so a GUI started without `--trusted-host` got a live,
+  // authenticated, completely unusable deployment published to the internet —
+  // a login page in front of an `/api` that answers 403 to everything.
+  //
+  // The proof that `TunnelManager.start()` was never reached is the key file:
+  // this row names one that does not exist, so any path that reaches `start()`
+  // must log the read failure. A blocked gate logs no such line.
+  const refused = createServer((_req, res) => {
+    res.writeHead(403, { 'content-type': 'text/plain' })
+    res.end('forbidden')
+  })
+  const refusedPort = await listen(refused)
+  const freePort = await serverPortForTest()
+  const home = join(workdir, 'home-fence-blocked')
+  const { context, lines, effects, routes, release, connect } = harnessContext()
+  /** @returns whether the captured console carries `text`. */
+  const printed = (text: string): boolean => lines.some(line => line.includes(text))
+  try {
+    await withEnv({ USERPROFILE: home, HOME: home }, async () => {
+      await apply(context, {
+        publicOrigin: 'https://dsh.example.test',
+        serverPort: freePort,
+        clientPort: refusedPort,
+        sessionTtlHours: 24,
+        // A closed port and a missing key: even if a future edit did open the
+        // tunnel here, this fixture could not reach anything.
+        tunnel: { enabled: true, host: '127.0.0.1', port: 1, user: 'root', privateKeyFile: join(home, 'absent-key') },
+      })
+    })
+    assert.ok(
+      await until(() => printed('the reverse tunnel stays closed')),
+      `the refusal must reach the console:\n${lines.join('\n')}`,
+    )
+    assert.equal(
+      printed('cannot read the SSH private key'),
+      false,
+      `the tunnel must never be started when the fence refuses:\n${lines.join('\n')}`,
+    )
+    assert.match(lines.find(line => line.includes('the reverse tunnel stays closed')) ?? '', /--trusted-host "dsh\.example\.test"/)
+
+    connect()
+    const statusRoute = routes.find(route => route.path === STATUS_PATH)
+    assert.ok(statusRoute !== undefined)
+    const payload = await statusRoute.fetch(new Request(`https://dsh.example.test${STATUS_PATH}`)).then(response => response.json()) as {
+      runtime: { gateway: string, tunnel: { state: string, attempts: number, lastError: string | null } | null, fence: { status: number, ok: boolean } | null },
+      info: { remoteBind: string | null, sshEquivalent: string | null },
+    }
+    // The gateway stays up: it is what serves this page and the local GUI.
+    assert.equal(payload.runtime.gateway, 'listening')
+    assert.equal(payload.runtime.tunnel?.state, 'blocked')
+    assert.equal(payload.runtime.tunnel?.attempts, 0, 'a blocked tunnel never dials the VPS')
+    assert.match(payload.runtime.tunnel?.lastError ?? '', /--trusted-host/)
+    assert.equal(payload.runtime.fence?.status, 403)
+    assert.equal(payload.runtime.fence?.ok, false)
+    // Where it would have listened is still reported: that is what the operator
+    // checks against `ss -ltnp` on the VPS to confirm nothing is exposed. The
+    // VPS-side port follows this row's gateway port, as `sshEquivalent` shows.
+    assert.equal(payload.info.remoteBind, `127.0.0.1:${String(freePort)}`)
+    assert.ok(payload.info.sshEquivalent !== null)
+  } finally {
+    for (const dispose of effects) await dispose()
+    release()
+    refused.closeAllConnections()
+    refused.close()
+  }
+})
+
+await check('an accepting fence still opens the tunnel', async () => {
+  // The other half of the contract: the gate must not become a way to keep a
+  // correctly launched deployment down. The stand-in upstream answers `/api`
+  // with 401, which is what a fence that accepts the Host says.
+  const freePort = await serverPortForTest()
+  const home = join(workdir, 'home-fence-accepted')
+  const { context, lines, effects, release } = harnessContext()
+  /** @returns whether the captured console carries `text`. */
+  const printed = (text: string): boolean => lines.some(line => line.includes(text))
+  try {
+    await withEnv({ USERPROFILE: home, HOME: home }, async () => {
+      await apply(context, {
+        publicOrigin: 'https://dsh.example.test',
+        serverPort: freePort,
+        clientPort: upstreamPort,
+        sessionTtlHours: 24,
+        tunnel: { enabled: true, host: '127.0.0.1', port: 1, user: 'root', privateKeyFile: join(home, 'absent-key') },
+      })
+    })
+    assert.ok(
+      await until(() => printed('cannot read the SSH private key')),
+      `the tunnel must be started once the fence accepts:\n${lines.join('\n')}`,
+    )
+    assert.equal(printed('the reverse tunnel stays closed'), false, lines.join('\n'))
+  } finally {
+    for (const dispose of effects) await dispose()
+    release()
+  }
+})
+
+await check('an indeterminate fence answer is re-asked before it blocks', async () => {
+  // `/api` answers 404 until its route owner mounts, and a stalled or restarting
+  // GUI answers nothing at all. Those describe the moment, not the deployment, so
+  // the gate re-asks before it closes the public entry for the life of the row.
+  let asked = 0
+  const flaky = createServer((_req, res) => {
+    asked += 1
+    if (asked < 3) {
+      res.writeHead(404, { 'content-type': 'text/plain' })
+      res.end('not found')
+      return
+    }
+    res.writeHead(401, { 'content-type': 'text/plain' })
+    res.end('unauthorized')
+  })
+  const flakyPort = await listen(flaky)
+  const freePort = await serverPortForTest()
+  const home = join(workdir, 'home-fence-flaky')
+  const { context, lines, effects, release } = harnessContext()
+  /** @returns whether the captured console carries `text`. */
+  const printed = (text: string): boolean => lines.some(line => line.includes(text))
+  try {
+    await withEnv({ USERPROFILE: home, HOME: home }, async () => {
+      await apply(context, {
+        publicOrigin: 'https://dsh.example.test',
+        serverPort: freePort,
+        clientPort: flakyPort,
+        sessionTtlHours: 24,
+        tunnel: { enabled: true, host: '127.0.0.1', port: 1, user: 'root', privateKeyFile: join(home, 'absent-key') },
+      })
+    })
+    assert.ok(
+      await until(() => printed('cannot read the SSH private key'), 5_000),
+      `a 404 that turns into a 401 must still open the tunnel:\n${lines.join('\n')}`,
+    )
+    assert.ok(asked >= 3, `the first 404s must be re-asked, not taken as final (asked ${String(asked)})`)
+    assert.equal(printed('the reverse tunnel stays closed'), false, lines.join('\n'))
+  } finally {
+    for (const dispose of effects) await dispose()
+    release()
+    flaky.closeAllConnections()
+    flaky.close()
+  }
+})
+
 await gateway.close()
 // The proxy leaves pooled upstream connections open on purpose; close them
 // explicitly or the stand-in server waits forever and the process never exits.
@@ -1943,6 +2087,26 @@ await check('the plugin carries no namespace prefix anywhere', async () => {
     if (text.includes(legacy)) offenders.push(file.slice(process.cwd().length + 1))
   }
   assert.deepEqual(offenders, [], `the removed path prefix reappeared in: ${offenders.join(', ')}`)
+})
+
+await check('every tunnel start in the composition goes through the fence gate', async () => {
+  // The behaviour is covered above; this is the source-level half. A third call
+  // site — a reconnection shortcut, a "trust again" fast path — would restore the
+  // bug the gate exists for, and it would do so silently: the deployment would
+  // look healthy while publishing a GUI that 403s every request.
+  //
+  // Exactly two are legitimate, and both are named here: `startTunnel`'s branch
+  // for a row that turns the tunnel off (nothing to gate) and the gated start
+  // itself. Any other `.start()` on the manager is the regression.
+  const source = await readFile(join(process.cwd(), 'src/index.ts'), 'utf8')
+  // Prose names the API too, and a comment about `tunnel.start()` is not a call
+  // site; strip both comment forms so this measures code rather than wording.
+  const code = source.replace(/\/\*[\s\S]*?\*\//gu, '').replace(/^[ \t]*\/\/.*$/gmu, '')
+  const direct = [...code.matchAll(/\btunnel\.start\(/gu)].length
+  assert.equal(direct, 0, 'the manager must be started through the gate, never through a direct tunnel.start() call')
+  const calls = [...code.matchAll(/\blive\.start\(\)/gu)].length
+  assert.equal(calls, 2, `expected the disabled branch and the gated start, found ${String(calls)} call site(s)`)
+  assert.ok(code.includes('const startTunnelWhenTrusted'), 'the gated starter must still exist')
 })
 
 console.log(`\n${String(checks - failures)}/${String(checks)} checks passed`)

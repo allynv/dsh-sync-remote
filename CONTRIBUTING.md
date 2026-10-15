@@ -198,10 +198,18 @@ ssh [-i <tunnel.privateKeyFile>] -p <tunnel.port> -N -R <serverPort>:127.0.0.1:<
 | 探测结果 | 含义 |
 | :--- | :--- |
 | `401` | Host 已被受信列表接受 ✅（属例行 `info`，不上控制台） |
-| `403` | 少了 `--trusted-host`，插件会打印修复命令 |
-| 无响应 | DSH 本体没起来 |
+| `403` | 少了 `--trusted-host`：插件打印修复命令，并**拒绝打开隧道**（见下） |
+| 无响应 | DSH 本体没起来（同样不开隧道） |
 
 > 这次探测**等 Loader 装载完成之后**才发（插件向 Host 要 `loader.await()`，和 `web-app` 打印 `dsh web:` 用的是同一个时机）。否则 `/api` 的路由还没挂上，探测会拿到 404 并误报一条 "expected 401"——那描述的是启动瞬间，不是你的部署。
+
+**探测结果是隧道的前置条件，不只是诊断。** `TunnelManager.start()` 只在围栏回 `401` 之后才被调用，所以围栏拒绝时**不会发出任何 `forwardIn`**：VPS 上没有监听、没有登录页、没有任何入口。原因很直接——围栏拒绝时经网关的每个请求都是 403，把隧道打开只会对外发布一个"能认证但完全不可用"的部署。
+
+- **只重试"不确定"的答复**（无响应 / 404 / 5xx）：最多 3 次、间隔 500 ms（`FENCE_CONFIRM_ATTEMPTS` / `FENCE_CONFIRM_DELAY_MS`）。`403` 和 `401` 都是围栏自己的答案，第一次探测就定案。
+- **不确定的答复也按"不暴露"处理**（fail closed），并给出与 403 不同的原因文案。
+- **不做常驻轮询**：`--trusted-host` 是 `dsh web` 的启动参数（`ctx.webStartup.trustedHosts`），进程存活期间不可能改变。因此不存在需要轮询的对象——进程重启、插件行重载（设置页保存即触发）、以及「重新信任」这三条路径都会重跑这次判定。
+- 状态用隧道的 `blocked` 表示（不是 `configError`：fence 不过不是本插件的配置错误），设置页对它显示专用横幅，**不会**显示那句讲 ssh2 原始错误的提示。
+- 只有两个地方能启动隧道：`startTunnel` 里 `tunnel.enabled: false` 的分支（没东西可 gate），和 gate 自己。selfcheck 有一条源码守卫盯着这个数字。
 
 ---
 
@@ -286,6 +294,10 @@ node test/acceptance.mts --state <file>   # 状态文件不是默认路径时
 6. **错误凭据**：把私钥路径改成错文件、或把 SSH 用户名写错，保存。期望明确的认证失败信息（不是无限刷屏）。
 7. **锁死保护**：删到只剩 1 把 Passkey。期望最后一个的删除按钮被禁用（Host 侧也会拒绝：`refusing to remove the last passkey`）。
 8. **一次性链接**：生成二维码后再打开同一个链接一次。期望链接已失效（403）、`enroll-url.txt` 已删除；点「重新生成」得到的新链接可用、旧的立即失效。
+9. **不带 `--trusted-host` 重启（本插件最重要的安全性质，必须人来做）**：把启动命令里的 `--trusted-host` 去掉，重启 DSH。
+   期望：控制台出现一行 `the reverse tunnel stays closed: … --trusted-host …`；设置页顶部隧道显示 `blocked`（红点）+ 专用红色横幅（**不是**那句讲 ssh2 的提示）；公网域名打不开。
+   **关键一步**：在 VPS 上跑 `sudo ss -ltnp | grep 3090`，应当**无任何输出**——插件连 `forwardIn` 都没发，所以不存在"能登录但界面空白"的机会。
+   把 `--trusted-host` 加回去重启，隧道应恢复 `listening`、公网恢复可用（自愈路径：进程重启 / 插件行重载 / 「重新信任」三者都会重跑判定）。
 
 ### D 段 · VPS 侧确认
 
@@ -293,6 +305,8 @@ node test/acceptance.mts --state <file>   # 状态文件不是默认路径时
 sudo ss -ltnp | grep 3090        # 期望：127.0.0.1:3090（sshd 监听，不是 0.0.0.0）
 sudo nginx -t && sudo systemctl reload nginx
 ```
+
+> 若本机 DSH 启动时**没带** `--trusted-host`，第一条命令应当**无输出**：插件刻意不开隧道，这是 C 段第 9 步的判据。
 
 ### 已实测（对着真实 DSH 3080 跑通，不是模拟）
 
@@ -330,7 +344,7 @@ sudo nginx -t && sudo systemctl reload nginx
 - 隧道只支持一台 VPS、一条端口映射；多目标请再挂一个插件行（id 不同即可）。
 - 不处理 Nginx 挂载前缀（`Location /ui/`）：DSH 的 Cookie 作用域与前缀改写需要额外配置，本插件按 origin 根路径设计。
 - `@deepseek-ai/schemastery` 与 `@deepseek-ai/cosmokit` 按**宿主 vendored 的同版本**（`3.18.5-alpha.1` / `1.8.6-alpha.1`）钉住：设置页靠 `schema.toJSON()` 的信封与宿主通信，版本漂移没有意义。它们从 npm 公开包安装，是这份 bundle 唯一两个 `@deepseek-ai/*` 依赖。
-- 设置页**不能**替你改 DSH 自己的两个命令行开关（`--trusted-host` / `--public-url`）：那是 `dsh web` 进程的启动参数，不属于本插件的行。页面只做预检并告诉你该加什么。
+- 设置页**不能**替你改 DSH 自己的两个命令行开关（`--trusted-host` / `--public-url`）：那是 `dsh web` 进程的启动参数，不属于本插件的行。页面只做预检，并据此**决定要不要开隧道**（预检不过就不开，见 §五「启动时的围栏探测」）。
 - 注册链接是**一次性**的：丢掉或过期就要重新生成。没有"固定注册令牌"这个选项——一个长期有效的注册凭据不值得留在磁盘上。
 - 自动登录重定向会把 DSH 的启动令牌放进一次 303 的 `Location`（随后 DSH 立即换成自己的 Cookie）。它是控制台本来就打印的那个凭据；若你不想让它出现在浏览器历史里，可以关掉这一行为（[src/index.ts](src/index.ts) 里不传 `dshEntry`），代价是新设备注册后要手动打开一次 `dsh web` 打印的 `?token=` 链接。
 - 控制台是**启动界面**，不是日志文件：正常启动插件只补一行本机链接，其余只打需要人处理的事。

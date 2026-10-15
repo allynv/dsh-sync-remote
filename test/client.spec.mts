@@ -381,6 +381,34 @@ await check('a stored passphrase reads as set and can be cleared', async () => {
   await settle()
 })
 
+await check('a blocked tunnel explains the flag instead of showing the ssh2 hint', async () => {
+  // `blocked` is a deliberate refusal, not a failure: the tunnel never dialed the
+  // VPS, so the banner must name the `dsh web` flag. The generic ssh2 banner would
+  // send the operator looking at ports and keys — and it would be a lie, because
+  // nothing was attempted.
+  const saved = statusPayload
+  statusPayload = {
+    ...saved,
+    runtime: {
+      ...saved.runtime,
+      tunnel: {
+        state: 'blocked', attempts: 0, channels: 0, remote: 'vps:22', hostKey: null,
+        lastError: 'the DSH browser-trust fence refused Host "dsh.example.test"; start the GUI with --trusted-host "dsh.example.test" (and --public-url https://dsh.example.test/), or every request through this gateway will 403 — the reverse tunnel stays closed until then',
+      },
+      fence: { authority: 'dsh.example.test', status: 403, ok: false },
+    },
+  }
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+  const text = flatten(render()).map((element) => JSON.stringify(element.props.children ?? '')).join('\n')
+  assert.match(text, /隧道没有开启/)
+  assert.match(text, /--trusted-host/)
+  assert.equal(/上面是 ssh2 报的原始原因/u.test(text), false, `a blocked tunnel must not carry the ssh2 hint:\n${text}`)
+  statusPayload = saved
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+})
+
 await check('the page polls the status instead of freezing on the first read', () => {
   assert.ok(intervalCalls.some((call) => call.ms === 10_000),
     `no 10s status poll was registered: ${JSON.stringify(intervalCalls.map((call) => call.ms))}`)

@@ -35,8 +35,16 @@ const BASE_RECONNECT_DELAY_MS = 1_000
 /** Jitter fraction applied to each delay so restarts do not synchronize. */
 const JITTER = 0.2
 
-/** Lifecycle of the tunnel, as the status endpoint reports it. */
-export type TunnelState = 'disabled' | 'starting' | 'connecting' | 'reconnecting' | 'listening' | 'failed' | 'stopped'
+/**
+ * Lifecycle of the tunnel, as the status endpoint reports it.
+ *
+ * `blocked` is the one state this manager never reaches on its own: the
+ * composition decides it is not allowed to open the tunnel at all (the local
+ * GUI's browser-trust fence refuses the public authority), so no SSH session is
+ * ever attempted and nothing is listening on the VPS. It is terminal until the
+ * plugin row is loaded again — see `block()`.
+ */
+export type TunnelState = 'disabled' | 'starting' | 'connecting' | 'reconnecting' | 'listening' | 'failed' | 'stopped' | 'blocked'
 
 /** Both spellings of one host key's SHA-256 fingerprint. */
 export interface HostKeyFingerprints {
@@ -211,7 +219,10 @@ export class TunnelManager {
    * @returns the state observed, never rejects.
    */
   waitForListening(timeoutMs: number): Promise<TunnelState> {
-    if (this.state === 'listening' || this.state === 'failed' || this.state === 'disabled') {
+    // `blocked` joins the terminal states: waiting cannot change it, only a new
+    // plugin load can, and a caller parked here would otherwise sit out the whole
+    // timeout for an answer already known.
+    if (this.state === 'listening' || this.state === 'failed' || this.state === 'disabled' || this.state === 'blocked') {
       return Promise.resolve(this.state)
     }
     return new Promise<TunnelState>((resolve) => {
@@ -220,6 +231,26 @@ export class TunnelManager {
         resolve: (state) => { clearTimeout(timer); resolve(state) },
       })
     })
+  }
+
+  /**
+   * Declare that this tunnel must not open at all, and why.
+   *
+   * The composition calls this instead of `start()` when the deployment cannot
+   * be served safely — today that means the local GUI's browser-trust fence
+   * refuses the authority browsers use, so every request through the gateway
+   * would 403. Opening the tunnel anyway would expose a live, authenticated,
+   * and completely unusable deployment, so the safe answer is to open nothing:
+   * no SSH session, no remote listener, no login page for anyone to reach.
+   *
+   * Deliberately not a retrying state: the condition is a `dsh web` launch
+   * parameter, so it can only clear when this plugin row is loaded again, and a
+   * manager that polled for it would only burn connects on a decided question.
+   * @param reason - one actionable sentence for the console and the settings page.
+   */
+  block(reason: string): void {
+    this.lastError = reason
+    this.setState('blocked')
   }
 
   /** Load the private key and open the first connection; rejects on a configuration fault. */

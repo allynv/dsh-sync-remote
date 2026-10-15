@@ -13,6 +13,11 @@
  *    server with `Host`, `Origin`, and the Fetch-Metadata headers untouched, so
  *    the GUI's own trust fence and signed session cookie keep working.
  *
+ * The tunnel is gated on the GUI that sits behind it: DSH's browser-trust fence
+ * must accept the public authority before any remote forward is requested, so a
+ * `dsh web` started without `--trusted-host` publishes nothing at all instead of
+ * a login page in front of an `/api` that answers 403.
+ *
  * The plugin needs no Host service to serve. The one it optionally uses is
  * `connection`, and only for two things: putting the settings page's routes
  * behind DSH's own browser-trust fence and operator session, and building the
@@ -34,8 +39,9 @@
 
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { describeConfig, plainRow, provenance, resolveConfig, type Provenance, type ResolvedConfig, type ResolvedTarget, type RowConfig } from './config.ts'
-import { Gateway } from './gateway.ts'
+import { Gateway, type PreflightResult } from './gateway.ts'
 import { registerRoutes, type RouteRegistry, type RouteSource } from './routes.ts'
 import { StateStore } from './state.ts'
 import { buildStatus, sshEquivalent } from './status.ts'
@@ -52,6 +58,30 @@ export { Config } from './config.ts'
 
 /** File beside the state file holding the current one-time enrollment URL. */
 const ENROLL_FILE = 'enroll-url.txt'
+
+/**
+ * How many times an *indeterminate* fence answer is re-asked, and how long
+ * between the asks.
+ *
+ * 403 and 401 are the fence's own answers and decide on the first probe. A
+ * timeout, a 404 from an `/api` route that has not mounted yet, or a 5xx
+ * describes the moment rather than the deployment, so this short burst keeps one
+ * bad moment from closing the public entry until the row is loaded again.
+ */
+const FENCE_CONFIRM_ATTEMPTS = 3
+const FENCE_CONFIRM_DELAY_MS = 500
+
+/**
+ * The one sentence that tells an operator how to make this deployment servable.
+ * @param authority - the public authority browsers use.
+ * @param origin - the configured public origin.
+ * @returns the fix, in the terms of the `dsh web` invocation.
+ */
+function fenceFix(authority: string, origin: string): string {
+  return `the DSH browser-trust fence refused Host ${JSON.stringify(authority)}; `
+    + `start the GUI with --trusted-host ${JSON.stringify(authority)} (and --public-url ${origin}/), `
+    + 'or every request through this gateway will 403'
+}
 
 /**
  * The console channel this plugin reports on, and the line between what an
@@ -199,6 +229,15 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
   let gateway: Gateway | null = null
   let tunnel: TunnelManager | null = null
   let fence: { authority: string; status: number } | null = null
+  /**
+   * The one way this bundle opens the tunnel, once the gateway exists.
+   *
+   * Assigned where the gateway is built rather than called directly, so the
+   * settings page's 「重新信任 / Trust again」 — which restarts the tunnel — goes
+   * through the same fence check the boot path does. A second entry point that
+   * skipped the check would be a way to expose a GUI that refuses to serve.
+   */
+  let startTunnel: (() => Promise<void>) | null = null
   /** Builds DSH's tokenized entry URL once the `connection` service is mounted. */
   let dshEntryFor: ((path: string) => string) | null = null
   const enrollFile = resolved === null ? null : join(dirname(resolved.stateFile), ENROLL_FILE)
@@ -276,40 +315,123 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
       log,
     })
     gateway.tunnel = tunnel
-    try {
-      await tunnel.start()
-    } catch (error) {
-      // A refused tunnel is a status, not a reason to drop the gateway: the
-      // gateway is still reachable on loopback and the settings page explains it.
-      statusError = reason(error)
-      log.error(`dsh-sync-remote: the reverse tunnel did not start: ${statusError}`)
+
+    const settings = resolved
+    const live = tunnel
+
+    /** Ask the fence once, and record the answer the settings page renders. */
+    const askFence = async (): Promise<PreflightResult> => {
+      const answer = await (gateway as Gateway).preflight()
+      fence = { authority: answer.authority, status: answer.status }
+      return answer
     }
 
-    // A wrong `--trusted-host` is the one misconfiguration that produces a live,
-    // authenticated, and completely unusable deployment. Ask the GUI directly —
-    // but only once boot has finished, because `/api` answers 404 until its
-    // route owner mounts and that answer describes the moment, not the
-    // deployment (see `onceLoaded`). The listener and the tunnel above are
-    // already serving by then; only this question waits.
-    const settings = resolved
-    const probing = gateway
-    onceLoaded(ctx, () => {
-      void probing.preflight().then((probe) => {
-        fence = { authority: probe.authority, status: probe.status }
-        if (probe.status === 0) {
-          log.warn(`dsh-sync-remote: the local DSH Web server at http://${settings.target.host}:${String(settings.target.port)} did not answer (${probe.error ?? 'no response'}); start it with dsh web`)
-        } else if (probe.status === 403) {
-          log.error(`dsh-sync-remote: the DSH browser-trust fence refused Host ${JSON.stringify(probe.authority)}; start the GUI with --trusted-host ${JSON.stringify(probe.authority)} (and --public-url ${settings.publicOrigin}/), or every request through this gateway will 403`)
-        } else if (probe.status === 401) {
-          log.info(`dsh-sync-remote: the local GUI accepts Host ${JSON.stringify(probe.authority)}; the missing piece is only its own launch-token sign-in`)
-        } else {
-          log.warn(`dsh-sync-remote: the local GUI answered HTTP ${String(probe.status)} for Host ${JSON.stringify(probe.authority)}; expected 401 from an unauthenticated /api request`)
+    /**
+     * Report one fence answer in the terms an operator can act on.
+     *
+     * A fence that accepts this authority is routine detail (and `info` is
+     * silent on this console on purpose); everything else is a human's job.
+     * @param answer - what the GUI answered for the public authority.
+     */
+    const reportFence = (answer: PreflightResult): void => {
+      if (answer.status === 403) {
+        log.error(`dsh-sync-remote: ${fenceFix(answer.authority, settings.publicOrigin)}`)
+      } else if (answer.status === 0) {
+        log.warn(`dsh-sync-remote: the local DSH Web server at http://${settings.target.host}:${String(settings.target.port)} did not answer (${answer.error ?? 'no response'}); start it with dsh web`)
+      } else if (answer.status === 401) {
+        log.info(`dsh-sync-remote: the local GUI accepts Host ${JSON.stringify(answer.authority)}; the missing piece is only its own launch-token sign-in`)
+      } else {
+        log.warn(`dsh-sync-remote: the local GUI answered HTTP ${String(answer.status)} for Host ${JSON.stringify(answer.authority)}; expected 401 from an unauthenticated /api request`)
+      }
+    }
+
+    /**
+     * Open the tunnel only once the GUI's fence has accepted the public
+     * authority, and open nothing at all when it has not.
+     *
+     * This is a precondition, not a diagnostic. A GUI whose browser-trust fence
+     * refuses this authority answers 403 to every request that arrives through
+     * the gateway, so a tunnel that opens anyway exposes a live, authenticated,
+     * and completely unusable deployment: a login page with nothing behind it,
+     * reachable by anyone who finds the port. Requesting no remote forward is
+     * the only answer that leaves nothing to find.
+     *
+     * The condition is a `dsh web` launch parameter, so it cannot change while
+     * this row is loaded — there is nothing to poll for. Every path that opens
+     * the tunnel runs this same check, which is why `startTunnel` is the only
+     * caller of `TunnelManager.start()`.
+     */
+    const startTunnelWhenTrusted = async (): Promise<void> => {
+      let answer = await askFence()
+      for (let attempt = 1; attempt < FENCE_CONFIRM_ATTEMPTS
+        && answer.status !== 401 && answer.status !== 403; attempt += 1) {
+        await delay(FENCE_CONFIRM_DELAY_MS)
+        answer = await askFence()
+      }
+      if (answer.status === 401) {
+        reportFence(answer)
+        try {
+          await live.start()
+        } catch (error) {
+          // A refused tunnel is a status, not a reason to drop the gateway: the
+          // gateway is still reachable on loopback and the settings page explains it.
+          statusError = reason(error)
+          log.error(`dsh-sync-remote: the reverse tunnel did not start: ${statusError}`)
         }
-      }, () => {
-        // The probe resolves on every outcome it classifies; a stray rejection
-        // here must not become an unhandled one.
+        return
+      }
+      // 403 is the fence answering about the authority; anything else is the GUI
+      // failing to answer the question at all. Both are refusals to open a tunnel,
+      // and the sentence differs only in what it tells the operator to look at.
+      const why = answer.status === 403
+        ? `${fenceFix(answer.authority, settings.publicOrigin)} — the reverse tunnel stays closed until then`
+        : `the local GUI did not confirm it accepts Host ${JSON.stringify(answer.authority)}`
+          + `${answer.status === 0 ? ` (${answer.error ?? 'no response'})` : ` (HTTP ${String(answer.status)})`}`
+          + '; the reverse tunnel stays closed until its /api answers 401'
+      live.block(why)
+      log.error(`dsh-sync-remote: the reverse tunnel stays closed: ${why}`)
+    }
+
+    /**
+     * The one way this bundle opens the tunnel: fence-checked when a tunnel is
+     * configured, and the plain — already decided — start when the row turns the
+     * tunnel off (which is a deliberate setting, not a condition to check).
+     * @returns after the tunnel is listening, refused, blocked, or disabled.
+     */
+    startTunnel = async (): Promise<void> => {
+      if (!settings.tunnel.enabled) {
+        await live.start()
+        return
+      }
+      await startTunnelWhenTrusted()
+    }
+
+    if (settings.tunnel.enabled) {
+      // A wrong `--trusted-host` is the one misconfiguration that produces a live,
+      // authenticated, and completely unusable deployment, so the tunnel waits for
+      // the answer — but only once boot has finished, because `/api` answers 404
+      // until its route owner mounts and that answer describes the moment, not the
+      // deployment (see `onceLoaded`). The gateway stays up meanwhile: it is what
+      // serves the settings page that reports the refusal.
+      onceLoaded(ctx, () => {
+        void startTunnelWhenTrusted().catch((error: unknown) => {
+          // Every classified outcome is handled above, so a rejection here is a
+          // defect rather than a deployment state: say so instead of losing it.
+          log.error(`dsh-sync-remote: the fence check failed unexpectedly: ${reason(error)}`)
+        })
       })
-    })
+    } else {
+      // Unchanged: no tunnel to gate, so it settles inside `apply` and the console
+      // gets its line before boot finishes. The fence question below is then pure
+      // reporting — the settings page still shows what the GUI answers.
+      await startTunnel()
+      onceLoaded(ctx, () => {
+        void askFence().then(reportFence, () => {
+          // The probe resolves on every outcome it classifies; a stray rejection
+          // here must not become an unhandled one.
+        })
+      })
+    }
 
     if (passkeys !== null && passkeys.enrolled) {
       log.info(`dsh-sync-remote: ${String(state?.passkeys.length ?? 0)} passkey(s) registered; sign in at ${resolved.publicOrigin}/signin`)
@@ -377,7 +499,9 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
         if (tunnel !== null) {
           // Reconnect so the next connection pins whatever the VPS presents now.
           await tunnel.stop()
-          await tunnel.start()
+          // Through the boot path's own starter: forgetting a key must not become
+          // a second way to open a tunnel the GUI's fence refuses to serve.
+          if (startTunnel !== null) await startTunnel()
         }
         return { ok: true }
       },

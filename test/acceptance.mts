@@ -325,7 +325,14 @@ await check('the passkey gateway reports the deployment it serves', () => {
   }
   const tunnel = report.tunnel
   if (tunnel !== null && tunnel.state !== 'disabled' && tunnel.state !== 'listening') {
-    throw new Error(`the tunnel is ${tunnel.state} (${tunnel.lastError ?? 'no error reported'}); a configured tunnel must be listening`)
+    // `blocked` is the deliberate refusal: the plugin never requested a remote
+    // forward because the GUI's fence refuses the public authority. It is the one
+    // state whose cause is not in the tunnel at all, so it says so instead of
+    // printing an empty `lastError`.
+    const why = tunnel.state === 'blocked'
+      ? 'the GUI refused the public Host, so the plugin opened no tunnel; restart dsh web with --trusted-host'
+      : (tunnel.lastError ?? 'no error reported')
+    throw new Error(`the tunnel is ${tunnel.state} (${why}); a configured tunnel must be listening`)
   }
   const tunnelNote = tunnel === null ? 'off' : `${tunnel.state} attempts=${String(tunnel.attempts)} channels=${String(tunnel.channels)}`
   return `origin ${publicOrigin} · rpID ${report.rpID} · bind ${report.bind} · web ${report.web} · enrolled=${String(report.enrolled)} `
@@ -352,6 +359,27 @@ await check('an untrusted Host is still refused (the fence is doing its job)', a
   const response = await plain(targetHost, targetPort, '/api', { host: 'fence-probe.invalid', accept: 'application/json' })
   if (response.status !== 403) throw new Error(`expected 403 for an untrusted Host, got ${String(response.status)}`)
   return 'a Host outside the trusted set gets 403'
+})
+
+await check('a refused fence means no listener, not a broken login page', async () => {
+  // The invariant worth more than any single fact above: if the GUI refuses the
+  // authority browsers use, this plugin must never have asked the VPS to listen.
+  // The deployment this check was written for was live, authenticated, and
+  // unusable — a remote visitor reached a login page in front of an `/api` that
+  // answered 403 to everything. Both facts are read now, in one moment, so a
+  // stale report cannot make them look consistent.
+  const fence = await plain(targetHost, targetPort, '/api', { host: publicAuthority, accept: 'application/json' })
+  const fresh = await plain(LOOPBACK, gatewayPort, GATEWAY_STATUS_PATH, { host: gatewayAuthority, 'x-dsh-gw-status': statusToken })
+  if (fresh.status !== 200) throw new Error(`${GATEWAY_STATUS_PATH} answered HTTP ${String(fresh.status)} on the second read`)
+  const tunnel = (JSON.parse(fresh.body) as GatewayStatus).tunnel
+  const state = tunnel === null ? 'off' : tunnel.state
+  if (fence.status === 403 && state === 'listening') {
+    throw new Error(`the fence refuses ${publicAuthority} (403) while the tunnel is listening: a remote visitor reaches a login page in front of an /api that 403s everything`)
+  }
+  if (fence.status === 401 && state !== 'listening' && state !== 'disabled') {
+    throw new Error(`the fence accepts ${publicAuthority} (401) but the tunnel is ${state}: the public entry point should be up (${tunnel?.lastError ?? 'no error reported'})`)
+  }
+  return `fence ${String(fence.status)} → tunnel ${state}${fence.status === 403 ? ' (nothing exposed, deliberately)' : ''}`
 })
 
 await check('the gateway refuses unauthenticated access to its own endpoints', async () => {
