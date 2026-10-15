@@ -662,6 +662,10 @@ await check('a failed test names the field in the page language, with the raw an
     { code: 'forward-refused', stage: 'forward', evidence: 'Unable to bind to 127.0.0.1:3090 on the remote host', expect: /服务端端口/u },
     { code: 'local-gui-missing', stage: 'local-gui', evidence: 'nothing answers http://127.0.0.1:1/', expect: /客户端端口/u },
     { code: 'public-wrong-service', stage: 'public', evidence: 'HTTP 200 without the nonce', expect: /没有指向本部署/u },
+    // The two codes this round added: another site took the domain, and the live chain
+    // itself refused (the fence case).
+    { code: 'public-other-upstream', stage: 'public', evidence: 'HTTP 403; Server: nginx; body: 3x-ui panel', expect: /别的上游/u },
+    { code: 'public-live-refused', stage: 'public', evidence: 'HTTP 403', expect: /--trusted-host/u },
     { code: 'auth', stage: 'ssh', evidence: 'client-authentication: All configured authentication methods failed', expect: /authorized_keys/u },
   ]
   for (const sample of samples) {

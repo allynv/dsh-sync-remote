@@ -69,6 +69,10 @@ export type ProbeCode =
   | 'forward-refused'
   | 'public-unreachable'
   | 'public-port-mismatch'
+  /** Something that is not this deployment answered the public address. */
+  | 'public-other-upstream'
+  /** The live (already running) chain answered, and refused. */
+  | 'public-live-refused'
   | 'public-wrong-service'
   | 'public-no-answer'
 
@@ -454,10 +458,17 @@ async function checkPublicNonce(config: ResolvedConfig, target: ProofTarget): Pr
     }
   }
   if (answer.status !== 200 || !answer.body.includes(target.nonce)) {
+    // Anything that answers here is *not* this deployment: the nonce server behind this
+    // test's own forward returns 200 with the nonce for every path and method, so a
+    // different status — or a 200 without the nonce — necessarily came from another
+    // upstream or from Nginx itself. A missing `server_name` for this domain falls
+    // through to the default site, which is exactly how a deployment ends up served by
+    // somebody else's vhost while its own tunnel port stays unreachable.
     return {
       ok: false,
-      code: 'public-wrong-service',
-      evidence: `${described}: the public address answered, but not with this test's nonce — the domain does not lead to this deployment`,
+      code: 'public-other-upstream',
+      evidence: `${described}: Nginx handed ${config.publicOrigin} to something that is not this deployment — `
+        + `nothing on the VPS reached 127.0.0.1:${String(config.tunnel.remotePort)} (a missing or wrong server_name falls through to the default site)`,
     }
   }
   return { ok: true }
@@ -494,7 +505,17 @@ async function checkPublicLive(config: ResolvedConfig, statusToken: string | nul
     }
   }
   if (answer.status !== 200) {
-    return { ok: false, code: 'public-wrong-service', evidence: `${described}: the domain does not lead to this deployment's gateway` }
+    // The live chain is this deployment's own tunnel, so a refusal here is the gateway
+    // or the GUI behind it answering — and a 403 is the DSH browser-trust fence, which
+    // means the GUI was started without this domain in --trusted-host.
+    return {
+      ok: false,
+      code: 'public-live-refused',
+      evidence: `${described}: the tunnel is up, so this answer came from this deployment's own gateway or GUI`
+        + (answer.status === 403
+          ? ' — a 403 is DSH refusing the Host, which means dsh web was started without --trusted-host naming this domain'
+          : ''),
+    }
   }
   const policy = headerOf(answer.headers, 'content-security-policy')
   const looksLikeGateway = useStatus
@@ -558,11 +579,35 @@ function requestPublic(url: string, headers: Record<string, string> = {}, redire
   })
 }
 
-/** @param answer - a public answer. @returns one phrase for the evidence line. */
+/**
+ * One phrase for the evidence line.
+ *
+ * The status alone says "something answered"; the `Server` header and the first
+ * characters of the body say *who* — which is the difference between "Nginx is
+ * misconfigured" and "another site on this VPS took the domain". Response cookies are
+ * deliberately not included: the probe is unauthenticated, but its evidence travels to
+ * a settings page and does not need to carry anybody's session.
+ * @param answer - a public answer.
+ * @returns the phrase.
+ */
 function describeAnswer(answer: PublicAnswer): string {
   if (answer.kind === 'timeout') return 'no answer'
   if (answer.kind === 'error') return answer.message
-  return `HTTP ${String(answer.status)}`
+  const parts = [`HTTP ${String(answer.status)}`]
+  const server = headerOf(answer.headers, 'server')
+  if (typeof server === 'string' && server !== '') parts.push(`Server: ${server}`)
+  const snippet = bodySnippet(answer.body)
+  if (snippet !== '') parts.push(`body: ${snippet}`)
+  return parts.join('; ')
+}
+
+/**
+ * @param body - a response body.
+ * @returns its first ~120 characters, on one line, without control characters.
+ */
+function bodySnippet(body: string): string {
+  const flat = body.replace(/[\u0000-\u001F\u007F]+/gu, ' ').replace(/\s+/gu, ' ').trim()
+  return flat.length > 120 ? `${flat.slice(0, 120)}…` : flat
 }
 
 /** @returns whether the body parses as the gateway's status JSON. */

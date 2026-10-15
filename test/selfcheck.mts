@@ -280,16 +280,23 @@ async function startFakeGui(status = 401): Promise<{ port: number, close(): Prom
 
 /**
  * A stand-in for Nginx: either it forwards every request to one port (the front
- * door doing its job), or it answers a fixed body (the front door pointing somewhere
- * else entirely).
+ * door doing its job), or it answers a fixed status and body (the front door pointing
+ * somewhere else entirely — another site on the same box).
  * @param target - the upstream port, or null to answer `body` instead.
  * @param body - what to answer when `target` is null.
+ * @param status - the status to answer when `target` is null.
  * @returns the ephemeral port it listens on and a disposer.
  */
-async function startFakeNginx(target: number | null, body = '<html>not this deployment</html>'): Promise<{ port: number, close(): Promise<void> }> {
+async function startFakeNginx(
+  target: number | null,
+  body = '<html>not this deployment</html>',
+  status = 200,
+): Promise<{ port: number, close(): Promise<void> }> {
   const server = createServer((request, response) => {
     if (target === null) {
-      response.writeHead(200, { 'content-type': 'text/html' })
+      // The `Server` header is set explicitly: it is what tells an operator "another
+      // site answered" in the evidence line, and the check below asserts it survives.
+      response.writeHead(status, { 'content-type': 'text/html; charset=utf-8', server: 'nginx' })
       response.end(body)
       return
     }
@@ -1146,14 +1153,35 @@ await check('a tunnel that authenticates against the wrong remote port fails the
     await wrongPort.close()
   }
 
-  // (b) The domain answers, but not with this deployment.
+  // (b) Another site on the same box answers 200 for everything: the nonce is missing,
+  // so this is not the deployment. (The nonce server answers 200 for every path, so a
+  // 200 without the nonce can only have come from somewhere else.)
   const impostor = await startFakeNginx(null)
   try {
     const answer = await run(`http://127.0.0.1:${String(impostor.port)}`)
     assert.equal(answer.ok, false, JSON.stringify(answer))
-    assert.equal(answer.code, 'public-wrong-service', JSON.stringify(answer))
+    assert.equal(answer.code, 'public-other-upstream', JSON.stringify(answer))
+    assert.match(String(answer.evidence), /Server: nginx/)
   } finally {
     await impostor.close()
+  }
+
+  // (e) The case that cost an afternoon: the domain has no server_name of its own, so
+  // Nginx falls through to the default site, which refuses with its own 403. The
+  // evidence must name the status, who answered, and what they said.
+  const otherSite = await startFakeNginx(null, '<html><body>3x-ui panel: forbidden host</body></html>', 403)
+  try {
+    const answer = await run(`http://127.0.0.1:${String(otherSite.port)}`)
+    assert.equal(answer.ok, false, JSON.stringify(answer))
+    assert.equal(answer.stage, 'public')
+    assert.equal(answer.code, 'public-other-upstream', JSON.stringify(answer))
+    const evidence = String(answer.evidence)
+    assert.match(evidence, /HTTP 403/, evidence)
+    assert.match(evidence, /Server: nginx/, evidence)
+    assert.match(evidence, /3x-ui panel: forbidden host/, evidence)
+    assert.match(evidence, /server_name/, evidence)
+  } finally {
+    await otherSite.close()
   }
 
   // (c) The public address cannot be reached from here at all.
@@ -1231,7 +1259,10 @@ await check('a running tunnel is used as the public proof instead of a second bi
     // The same live chain with the wrong token is not this deployment's gateway.
     const impostor = await probeTunnel({ config, pin: null, liveRemotePort: serverPort, statusToken: 'not-the-token', log: silentLog })
     assert.equal(impostor.ok, false, JSON.stringify(impostor))
-    assert.equal(impostor.code, 'public-wrong-service', JSON.stringify(impostor))
+    // A refusal from the live chain is this deployment answering — for a 403 that means
+    // the GUI's fence, i.e. dsh web without this domain in --trusted-host.
+    assert.equal(impostor.code, 'public-live-refused', JSON.stringify(impostor))
+    assert.match(String(impostor.evidence), /--trusted-host/)
   } finally {
     gateway.closeAllConnections()
     await new Promise<void>((resolve) => { gateway.close(() => { resolve() }) })

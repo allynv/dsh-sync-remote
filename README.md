@@ -143,6 +143,36 @@ server {
 sudo ss -ltnp | grep 3090     # 期望 127.0.0.1:3090；若是 0.0.0.0 说明 GatewayPorts 被打开了
 ```
 
+### 一台 VPS 上跑多个部署（很常见的坑）
+
+每个部署要**自己一段 `server` 块**，而且三样东西必须一一对应：
+
+| 项 | 必须对应 |
+| :--- | :--- |
+| `server_name` | 该部署的域名（**不能**复制过来忘了改） |
+| `proxy_pass` 端口 | 该部署设置页里的「服务端端口」 |
+| `--trusted-host`（那台机器上启动 DSH 时） | 同一个域名 |
+
+```nginx
+# 部署 A（老机器）
+server { listen 443 ssl; server_name dsh.example.com;  location / { proxy_pass http://127.0.0.1:3090; ... } }
+# 部署 B（新机器）——server_name 必须改，端口必须是 B 自己的
+server { listen 443 ssl; server_name xyb.example.com;  location / { proxy_pass http://127.0.0.1:3091; ... } }
+```
+
+**两个自查命令**（复制粘贴错误就靠它们暴露）：
+
+```sh
+sudo nginx -t | grep -i conflict
+# 出现 conflicting server name "xxx" ... ignored ⇒ 有两段块用了同一个 server_name，
+# 后一段整个被 Nginx 忽略（它的 proxy_pass 端口等于从未生效），而未配置的域名会落到
+# 默认站点（同机器上的别的服务）上去。
+
+curl -sS -o /dev/null -w '%{http_code}\n' -H 'Host: xyb.example.com' http://127.0.0.1/
+```
+
+判断标准很简单：**新的域名应当返回 502**（Nginx 指向了它该指的那个端口，而那个端口上此刻还没有隧道）；如果返回的是 403/404/200，说明它被交给了**别的站点**——回到上面那张表逐项对。把这些都对好之后，设置页的「测试连接」就是最终的端到端判据。
+
 ---
 
 ## 开始使用

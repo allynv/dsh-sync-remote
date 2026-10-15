@@ -8,10 +8,41 @@
 | `v1.1.0` | `3e9b518` | 1.1.0 | 围栏 gate、失败分类、**测试通过才允许保存**、配置指纹 |
 | `v1.2.0` | `dfd34d2` | 1.2.0 | 测试必须证明**公网真的回到本机** |
 | `v1.2.1` | `aaf36a3` | 1.2.1 | 修复：全新安装时第一份配置存不进去 |
+| `v1.2.2` | 见下方标签 | 1.2.2 | 公网往返：点名"谁把这个域名接走了" |
 
 > `v1.1.0` 汇总了自 `v1.0.0` 起的全部改动（README 重写、围栏 gate、回环页可编辑、失败分类、中文文案、listener 只在认证成功后绑定）——这些提交在版本号上一直挂着 1.0.0，实际行为属于 1.1.0。
 
 **发布方式**：GitHub Releases 的创建需要 API 令牌（`gh` CLI 或网页）。标签已经推送，网页上「Draft a new release」→ 选择对应 tag → 粘贴下面同名小节即可。
+
+---
+
+## v1.2.2 — 公网往返：点名"谁把这个域名接走了"
+
+**起因**：一台新机器首装后配置测试失败，报「公网地址回了别的东西：这个域名没有指向本部署（Nginx 指到了别的服务，或 CDN 缓存了旧内容）」。查下去发现是 VPS 上的 Nginx 笔误：新域名的 `server` 块是从旧部署复制来的，**`server_name` 忘了改**（仍是旧域名），于是
+
+- `nginx -t` 报 `conflicting server name "…" ignored`，那个块（`proxy_pass 127.0.0.1:3091`）被 Nginx **整个忽略**；
+- 新域名没有匹配的 `server_name`，落到 443 的**默认站点**（同一台 VPS 上的另一个服务），由它回了 403；
+- 插件的判定**是对的**，但措辞太笼统——"回了别的东西"没法让人一眼看出是"域名被别的站点接走了"。
+
+### 改进
+
+- **临时转发路径的判定更硬**：nonce 服务对**任何路径、任何方法**都回 200 + nonce，所以在这个分支里回来的任何别的回应都**不可能**是本插件——
+  - 502/504 ⇒ `public-port-mismatch`（Nginx 到了 VPS，但该端口上没有隧道）；
+  - **任何其他状态码，或 200 但没有 nonce ⇒ 新码 `public-other-upstream`**：「Nginx 把这个域名交给了别的上游，本部署的端口根本没收到请求」，并指出最常见原因是该域名**没有 `server_name`**、落到了默认站点。
+- **活链路径**（隧道正在运行时）非 200 ⇒ **新码 `public-live-refused`**：这类回应必然来自本部署自己的网关或它后面的 DSH GUI；**403 = DSH 的浏览器信任围栏**，也就是那台机器启动 `dsh web` 时没加 `--trusted-host <该域名>`。
+- **证据带上"谁答的"**：`原始原因` 一行现在附 `Server` 头与响应体前 ~120 字符（单行化、剔控制字符、**不含任何 Cookie**），例如
+  `HTTP 403; Server: nginx; body: <html>…forbidden host…`。
+- **文档**：README 新增「一台 VPS 上跑多个部署」——`server_name` / `proxy_pass` 端口 / `--trusted-host` 三者必须一一对应；自查用 `nginx -t | grep -i conflict` 与 `curl -H 'Host: <域名>' http://127.0.0.1/`；判据是**新域名应当返回 502**（端口指对了但隧道还没起），若回 403/404/200 就说明被交给了别的站点。CONTRIBUTING 补上这张状态分类表及其推理依据。
+
+### 未改
+
+判定逻辑本身、指纹构成、`public-port-mismatch` 的语义。插件**不读** Nginx 配置、**不在 VPS 上执行 curl**（唯一允许的远端动作仍只是可选的 stale-sshd 释放）。
+
+### 验证
+
+- selfcheck **69/69**：新增「伪 Nginx 回 403 + `Server: nginx` + 面板正文 ⇒ `public-other-upstream`，且证据里能读出状态码、`Server` 头与正文」，并把"回一个 200 固定页面"的期望从 `public-wrong-service` 改为 `public-other-upstream`（同一推理）；活链 403 ⇒ `public-live-refused` 且点名 `--trusted-host`。
+- 客户端 **20 项**：两个新码的中文文案 + 原始证据行渲染。
+- 现网：VPS 上那一行改回 `server_name xyb.skg.us.ci` 后，`nginx -t` 不再有冲突告警；`xyb.skg.us.ci` 由 **403 → 502**（Nginx 已指对端口，等新机器隧道起来），`dsh.skg.us.ci` 仍 401 不变。
 
 ---
 

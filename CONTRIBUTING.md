@@ -250,8 +250,18 @@ ssh [-i <tunnel.privateKeyFile>] -p <tunnel.port> -N -R <serverPort>:127.0.0.1:<
 
 第 6 阶段是唯一能发现"端口对不上"的手段，它有两种取证方式：
 
-- **临时转发（`publicCheck: 'forward'`）**：测试自己启动一个只回答随机 nonce 的临时 loopback HTTP 服务，把第 5 步绑到的端口收到的连接桥接过去，然后 `GET <publicOrigin>/__dsh-sync-remote-probe/<nonce>`。**拿到 nonce** ⇒ DNS → Nginx → `127.0.0.1:serverPort` → 这条 SSH 会话 → 本进程，整条链成立；**502/504** ⇒ Nginx 到了 VPS 而那个端口上没有隧道（`public-port-mismatch`）；**200 但没有 nonce** ⇒ 域名指向了别处（`public-wrong-service`）。
-- **活链签名（`publicCheck: 'live'`）**：端口只能绑一次，所以当**正在运行的隧道**已经占着候选端口时（改的是别的字段），测试不重复绑，改为向活链索取只有本网关能给出的签名——带状态文件只读令牌请求 `<publicOrigin>/status`（要求 200 + JSON 里有 `origin`），没有令牌时退化为 `<publicOrigin>/signin` + CSP `default-src 'none'`。`liveRemotePort` 由 `index.ts` 从 `tunnel.snapshot().state === 'listening'` + 已保存的 `serverPort` 传入。
+- **临时转发（`publicCheck: 'forward'`）**：测试自己启动一个只回答随机 nonce 的临时 loopback HTTP 服务，把第 5 步绑到的端口收到的连接桥接过去，然后 `GET <publicOrigin>/__dsh-sync-remote-probe/<nonce>`。**拿到 nonce** ⇒ DNS → Nginx → `127.0.0.1:serverPort` → 这条 SSH 会话 → 本进程，整条链成立。
+  这里的分类有一条硬依据：**nonce 服务对任何路径、任何方法都回 200 + nonce**，所以在这个分支里回来的任何别的回应都**不可能**是本插件——它可以断言式地写出来：
+
+  | 回应 | code | 含义 |
+  | :--- | :--- | :--- |
+  | 502 / 504 | `public-port-mismatch` | Nginx 到了 VPS，但 `serverPort` 上没有隧道（`proxy_pass` 端口不对，或转发没生效） |
+  | 任何其他状态码，或 200 但没有 nonce | `public-other-upstream` | 域名被交给了**别的上游**或 Nginx 自己：最常见的是该域名**没有 `server_name`**，落到了默认站点（同机器上的另一个服务） |
+  | 连不上 / DNS / TLS 失败 | `public-unreachable` | 这台机器到不了自己的公网地址 |
+  | 超时 | `public-no-answer` | 无人应答 |
+
+  证据行会带上 `Server` 头与响应体前 ~120 字符（`describeAnswer`/`bodySnippet`，不含任何 Cookie），所以"是谁答的"一眼可见。
+- **活链签名（`publicCheck: 'live'`）**：端口只能绑一次，所以当**正在运行的隧道**已经占着候选端口时（改的是别的字段），测试不重复绑，改为向活链索取只有本网关能给出的签名——带状态文件只读令牌请求 `<publicOrigin>/status`（要求 200 + JSON 里有 `origin`），没有令牌时退化为 `<publicOrigin>/signin` + CSP `default-src 'none'`。`liveRemotePort` 由 `index.ts` 从 `tunnel.snapshot().state === 'listening'` + 已保存的 `serverPort` 传入。这条分支上**非 200 就是本部署自己拒绝**（`public-live-refused`）：403 即 DSH 的浏览器信任围栏，也就是那台机器启动 `dsh web` 时没把该域名写进 `--trusted-host`。
 
 第 5、6 步都在 `finally` 里释放（`unforwardIn` + 关掉 nonce 服务 + `client.end()`），所以测试结束不留任何监听。`hostVerifier` **只比对钉、不写钉**（TOFU 仍只发生在隧道自己第一次连上时），不一致则以 `host-key` 失败并给出两边指纹。
 
@@ -340,7 +350,7 @@ node test/selfcheck.mts
 node test/client.spec.mts
 ```
 
-期望：最后一行为 `N/N checks passed`（N 随版本增长），退出码 0。这一段证明的是**代码本身**：签名 Cookie、配置解析与来源标注（含"环境变量完全不影响结果"）、地址语法闸门与配置指纹、状态文件（含"旧文件没有指纹环也能加载"）、代理头改写、经代理的真实 WebSocket 101 往返、隧道退避与主机密钥、**对着一个 ssh2 真服务器跑通的连接测试**（成功 / 认证拒绝 / 主机密钥不符且不写钉 / 不可达 / 私钥读不到 / 本机端口无人应答）、**公网往返的三种结局**（伪 Nginx 转发到别的端口 ⇒ `public-port-mismatch`、回一个固定页面 ⇒ `public-wrong-service`、地址不可达 ⇒ `public-unreachable`）、**端口被占 ⇒ `forward-refused`**、**活链签名**（`publicCheck: 'live'`，且必须带上只读令牌）、设置页的 Config schema / 状态载荷 / 路由拒绝路径、一次性注册链接的生成-替换-退役、DSH 自动登录重定向（含防循环）、`apply()` 入口、拒绝配置时不卸载、指纹闸门（未验证不拨号）、销毁，以及产物与路径护栏。
+期望：最后一行为 `N/N checks passed`（N 随版本增长），退出码 0。这一段证明的是**代码本身**：签名 Cookie、配置解析与来源标注（含"环境变量完全不影响结果"）、地址语法闸门与配置指纹、状态文件（含"旧文件没有指纹环也能加载"）、代理头改写、经代理的真实 WebSocket 101 往返、隧道退避与主机密钥、**对着一个 ssh2 真服务器跑通的连接测试**（成功 / 认证拒绝 / 主机密钥不符且不写钉 / 不可达 / 私钥读不到 / 本机端口无人应答）、**全新空行也能通过测试并写入与保存后一致的那份指纹**、**公网往返的各类结局**（伪 Nginx 转发到别的端口 ⇒ `public-port-mismatch`；回一个固定 200 页面 ⇒ `public-other-upstream`；回 403 + `Server: nginx` + 面板正文 ⇒ 同样是 `public-other-upstream` 且证据里能读出状态、`Server` 头和正文；地址不可达 ⇒ `public-unreachable`）、**端口被占 ⇒ `forward-refused`**、**活链签名**（`publicCheck: 'live'`，必须带上只读令牌；活链回 403 ⇒ `public-live-refused` 且点名 `--trusted-host`）、设置页的 Config schema / 状态载荷 / 路由拒绝路径、一次性注册链接的生成-替换-退役、DSH 自动登录重定向（含防循环）、`apply()` 入口、拒绝配置时不卸载、指纹闸门（未验证不拨号）、销毁，以及产物与路径护栏。
 
 > 公网往返的自检**不需要真实 VPS 或域名**：ssh2 自带的 `Server` 夹具实现了 `tcpip-forward`（收到请求就绑一个 loopback 端口，每条连接用 `forwardOut` 交回客户端，会话结束时连同监听一起收掉），"伪 Nginx" 是一个把请求转发到指定端口的本地 HTTP 服务，`publicOrigin` 就指向 `http://127.0.0.1:<伪Nginx端口>`。于是 DNS→Nginx→VPS端口→SSH会话→本进程 这条链在自检里是**真的跑通**的，而不是被 mock 掉的。
 
