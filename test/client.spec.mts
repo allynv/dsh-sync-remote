@@ -118,12 +118,25 @@ const missingKeys = new Set<string>()
 const mutations: RecordedOp[][] = []
 const disposers: (() => void)[] = []
 
-const snapshotBase = {
+/**
+ * The configuration-form snapshot, in the exact shape DSH's `ConfigFormSnapshot`
+ * has: `{ status, value, base, user, revision, writable }`.
+ *
+ * It deliberately carries NO `mode`: an earlier version of this stub invented
+ * that field, and the product's write rule was written against the invention — so
+ * every input stayed disabled on every page (the loopback one included) while
+ * these checks kept passing. A stub that is not the real shape cannot catch that.
+ */
+const snapshotBase: {
+  revision: number | undefined
+  writable: boolean
+  status: 'loading' | 'ready' | 'unavailable'
+  user: Record<string, unknown>
+} = {
   revision: 1,
   writable: true,
-  mode: 'host',
-  status: 'active',
-  user: {} as Record<string, unknown>,
+  status: 'ready',
+  user: {},
 }
 let snapshot = { ...snapshotBase }
 
@@ -138,6 +151,8 @@ const formListeners: (() => void)[] = []
 
 let section: (() => AnyElement) | null = null
 let statusPayload: Record<string, any> = {}
+/** Every path the page fetched, so an action can be proven to have called its route. */
+const fetchedPaths: string[] = []
 
 const ctx = {
   effect(factory: () => unknown, label?: string) {
@@ -207,6 +222,18 @@ function button(tree: AnyElement, text: string): AnyElement {
   return match as AnyElement
 }
 
+/** Every string the tree renders, joined: for copy assertions. */
+function renderedText(tree: AnyElement): string {
+  return flatten(tree).map((element) => JSON.stringify(element.props.children ?? '')).join('\n')
+}
+
+/** The configuration controls the page's write rule gates (text boxes and the tristate). */
+function configControls(tree: AnyElement): AnyElement[] {
+  return flatten(tree).filter((element) =>
+    (element.props.className === 'sr-input' || element.props.className === 'sr-select')
+    && typeof element.props.onChange === 'function')
+}
+
 /** Let the client's promises settle and re-render. */
 async function settle(times = 4): Promise<void> {
   for (let i = 0; i < times; i += 1) await Promise.resolve()
@@ -259,14 +286,25 @@ statusPayload = {
 }
 
 ;(globalThis as any).fetch = async (path: string): Promise<any> => {
+  fetchedPaths.push(String(path))
   if (String(path).includes('enroll.mint')) return { ok: true, status: 200, json: async () => ({ url: 'https://dsh.example.test/auth?token=x', qr: 'data:image/svg+xml;base64,AA', expiresAt: Date.now() + 600_000 }) }
   return { ok: true, status: 200, json: async () => statusPayload }
 }
 ;(globalThis as any).styles = { insert: () => () => {} }
 ;(globalThis as any).document = undefined
 
+/**
+ * The page authority the client's write rule reads (`window.location.hostname`).
+ *
+ * A mutable holder, because "may this page edit?" is exactly what the checks
+ * below are about: every one of them says which machine it is pretending to be
+ * rather than inheriting one. The starting value is the loopback page, the only
+ * page allowed to write.
+ */
+const pageLocation = { hostname: '127.0.0.1', host: '127.0.0.1:3080' }
+
 const entry = await new Promise<{ id: string, factory: (require: (name: string) => unknown) => any }>((resolve) => {
-  ;(globalThis as any).window = { __ModuleLoader__: { load: (value: unknown) => resolve(value as never) } }
+  ;(globalThis as any).window = { __ModuleLoader__: { load: (value: unknown) => resolve(value as never) }, location: pageLocation }
   // src/client.ts is deliberately a classic script, not a module: DSH loads a
   // client bundle through a same-origin `<script src>` with no type="module", so
   // an export statement in it would be a browser syntax error. A dynamic import
@@ -376,6 +414,200 @@ await check('a stored passphrase reads as set and can be cleared', async () => {
     flatten(tree).some((element) => element.type === 'button' && element.props.children === '恢复默认'),
     'a stored passphrase needs a control that clears it',
   )
+  statusPayload = saved
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+})
+
+await check('a loopback page can really edit the configuration', async () => {
+  // The regression this check exists for: the page decided writability with
+  // `snapshot.mode === 'host'`, and DSH's form snapshot has no `mode` field — so
+  // the condition was false everywhere and every input, the save control, and the
+  // reset control were disabled on every page, 127.0.0.1 included. Editing the
+  // configuration is the entire purpose of this settings page.
+  pageLocation.hostname = '127.0.0.1'
+  setSnapshot({ ...snapshotBase })
+  const tree = render()
+  const controls = configControls(tree)
+  assert.ok(controls.length > 0, 'the page must render configuration controls')
+  assert.ok(
+    controls.every((element) => element.props.disabled !== true),
+    'every configuration control must be editable on a loopback page',
+  )
+  assert.equal(button(tree, '保存并应用').props.disabled, false, 'the save control must be usable on a loopback page')
+  assert.equal(renderedText(tree).includes('本页只读'), false, 'a loopback page must not carry the read-only banner')
+})
+
+await check('every other page authority stays read-only, with its reason on screen', async () => {
+  // The rule the loopback case above must not weaken: this page is edited on the
+  // machine running DSH, never through the public address.
+  for (const hostname of ['localhost', '127.0.0.1', '127.1.2.3', '[::1]']) {
+    pageLocation.hostname = hostname
+    setSnapshot({ ...snapshotBase })
+    const controls = configControls(render())
+    assert.ok(controls.length > 0, `${hostname}: the page must render configuration controls`)
+    assert.ok(
+      controls.every((element) => element.props.disabled !== true),
+      `${hostname} is a loopback authority and must be editable`,
+    )
+  }
+  for (const hostname of ['127.999.1.1', '192.168.1.5', 'evil.example']) {
+    pageLocation.hostname = hostname
+    setSnapshot({ ...snapshotBase })
+    const tree = render()
+    const controls = configControls(tree)
+    assert.ok(controls.length > 0, `${hostname}: the page must render configuration controls`)
+    assert.ok(
+      controls.every((element) => element.props.disabled === true),
+      `${hostname} is not loopback and must be read-only`,
+    )
+    assert.ok(renderedText(tree).includes('本页只读'), `${hostname} must say why it cannot be edited`)
+  }
+  pageLocation.hostname = '127.0.0.1'
+  setSnapshot({ ...snapshotBase })
+  render()
+})
+
+await check('a configuration the client has not accepted is locked with its own reason', async () => {
+  // "Greyed out" has four different causes and the page has to name the right one:
+  // a read-only page authority, a Host document that refuses writes, a value still
+  // in flight, and a value the Host sent that this client cannot accept.
+  pageLocation.hostname = '127.0.0.1'
+  setSnapshot({ revision: undefined, writable: true, status: 'loading', user: {} })
+  assert.ok(renderedText(render()).includes('正在读取配置'), 'a read still in flight must say so, not blame the row')
+  setSnapshot({ revision: 3, writable: true, status: 'loading', user: {} })
+  assert.ok(renderedText(render()).includes('没有通过 Host 的校验'), 'an unaccepted value must name the real reason')
+  setSnapshot({ revision: undefined, writable: true, status: 'unavailable', user: {} })
+  assert.ok(renderedText(render()).includes('插件行当前未激活'), 'a namespace the Host does not serve keeps its own message')
+  setSnapshot({ revision: 3, writable: false, status: 'ready', user: {} })
+  assert.ok(renderedText(render()).includes('不接受写入'), 'a Host document that refuses writes must say that instead')
+  setSnapshot({ ...snapshotBase })
+  render()
+  assert.deepEqual([...missingKeys], [], `keys with no Chinese text: ${[...missingKeys].join(', ')}`)
+})
+
+await check('a public page reached at an authority the plugin does not publish says so', async () => {
+  // The gate asks the fence about the authority this plugin publishes; a browser
+  // can only arrive at the authority it typed. Reading this page at all proves the
+  // fence accepted *that* one — so when the two differ, the deployment is published
+  // and trusted out of step, which is the one mismatch no server-side probe sees.
+  const saved = statusPayload
+  pageLocation.hostname = 'dsh.example.test'
+  pageLocation.host = 'dsh.example.test'
+  assert.equal(renderedText(render()).includes('插件发布的公网地址'), false, 'the published authority itself must not warn')
+  pageLocation.host = 'other.example.test'
+  statusPayload = { ...saved, effective: { ...saved.effective, publicOrigin: 'https://dsh.example.test' } }
+  const text = renderedText(render())
+  assert.ok(text.includes('插件发布的公网地址'), `a mismatched page authority must warn:\n${text}`)
+  assert.ok(text.includes('other.example.test') && text.includes('dsh.example.test'), 'the warning must name both authorities')
+  // The operator's own machine is the normal place to edit, never a mismatch.
+  pageLocation.hostname = '127.0.0.1'
+  pageLocation.host = '127.0.0.1:3080'
+  assert.equal(renderedText(render()).includes('插件发布的公网地址'), false, 'the loopback editing page must stay quiet')
+  statusPayload = saved
+  render()
+})
+
+await check('a classified failure names the field to fix, and offers a retry', async () => {
+  // ssh2's own wording ("All configured authentication methods failed") tells an
+  // operator nothing about which of six configured values is wrong. The Host
+  // classifies the failure; this page has to turn the class into an instruction,
+  // keep the raw text as evidence, and let the operator skip the backoff.
+  const saved = statusPayload
+  const tunnelOf = (fields: Record<string, unknown>): Record<string, unknown> => ({
+    state: 'reconnecting', attempts: 3, channels: 0, remote: 'vps:22', hostKey: null,
+    everListening: false, nextRetryAt: null, suspected: null, lastError: null, ...fields,
+  })
+
+  statusPayload = {
+    ...saved,
+    runtime: {
+      ...saved.runtime,
+      tunnel: tunnelOf({ kind: 'auth', lastError: 'client-authentication: All configured authentication methods failed' }),
+    },
+  }
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+  const authText = renderedText(render())
+  assert.ok(authText.includes('SSH 认证被拒'), `an auth failure must name the credential problem:\n${authText}`)
+  assert.ok(authText.includes('All configured authentication methods failed'), 'the raw reason stays as evidence')
+
+  // A deployment that has never once come up is a different message from one that
+  // dropped: the page must stop saying "reconnecting" and point at the two fields
+  // that can produce it.
+  statusPayload = {
+    ...saved,
+    runtime: {
+      ...saved.runtime,
+      tunnel: tunnelOf({
+        kind: 'unreachable',
+        attempts: 9,
+        nextRetryAt: Date.now() + 60_000,
+        suspected: 'configuration',
+        lastError: 'client-socket: connect ECONNREFUSED 1.2.3.4:22',
+      }),
+    },
+  }
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+  const escalated = render()
+  const escalatedText = renderedText(escalated)
+  assert.ok(escalatedText.includes('VPS 地址'), `a never-working deployment must point at the address and port:\n${escalatedText}`)
+  assert.ok(escalatedText.includes('一次都没成功过'), 'the escalation must say why it suspects the configuration')
+  assert.ok(escalatedText.includes('下次重试'), 'the fact line must carry the countdown to the next attempt')
+
+  fetchedPaths.length = 0
+  button(escalated, '立即重试').props.onClick()
+  await settle()
+  assert.deepEqual(
+    fetchedPaths.filter(path => path.includes('tunnel.retry')),
+    ['/api/sync-remote.tunnel.retry'],
+    `the retry control must call the Host route: ${JSON.stringify(fetchedPaths)}`,
+  )
+
+  statusPayload = saved
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+})
+
+await check('the release control appears only for a refused port, and only when the row allows it', async () => {
+  // The sharpest capability in the plugin gets the narrowest doorway: it is offered
+  // for exactly one classified failure (the VPS refusing to bind), and only when the
+  // row itself switched it on. A control the Host would refuse is worse than none.
+  const saved = statusPayload
+  const refused = {
+    state: 'reconnecting', kind: 'forward-refused', attempts: 4, channels: 0, remote: 'vps:22', hostKey: null,
+    everListening: false, nextRetryAt: null, suspected: null,
+    lastError: 'the VPS refused to listen on 127.0.0.1:3090 (Unable to bind to 127.0.0.1:3090); on the VPS run `sudo ss -ltnp | grep 3090`',
+  }
+  const hasRelease = (tree: AnyElement): boolean =>
+    flatten(tree).some(element => element.type === 'button' && element.props.children === '释放 VPS 端口')
+
+  statusPayload = { ...saved, effective: { ...saved.effective, 'tunnel.releaseStaleForward': false }, runtime: { ...saved.runtime, tunnel: refused } }
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+  const offTree = render()
+  assert.equal(hasRelease(offTree), false, 'a row that does not allow the release must not offer it')
+  assert.ok(renderedText(offTree).includes('ss -ltnp'), 'the refusal still carries the command to run by hand')
+
+  statusPayload = { ...saved, effective: { ...saved.effective, 'tunnel.releaseStaleForward': true }, runtime: { ...saved.runtime, tunnel: refused } }
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+  fetchedPaths.length = 0
+  button(render(), '释放 VPS 端口').props.onClick()
+  await settle()
+  assert.deepEqual(
+    fetchedPaths.filter(path => path.includes('tunnel.release')),
+    ['/api/sync-remote.tunnel.release'],
+    `the release control must call the Host route: ${JSON.stringify(fetchedPaths)}`,
+  )
+
+  // And not for any other failure: an authentication rejection is not a port conflict.
+  statusPayload = { ...saved, effective: { ...saved.effective, 'tunnel.releaseStaleForward': true }, runtime: { ...saved.runtime, tunnel: { ...refused, kind: 'auth' } } }
+  button(render(), '刷新状态').props.onClick()
+  await settle()
+  assert.equal(hasRelease(render()), false, 'only the refused remote forward may offer the release')
+
   statusPayload = saved
   button(render(), '刷新状态').props.onClick()
   await settle()

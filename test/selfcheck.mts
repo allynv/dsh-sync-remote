@@ -25,13 +25,14 @@ import { StateStore, loadState, loadStateOrCreate } from '../src/state.ts'
 import { ENROLL_TOKEN_TTL_MS, Gateway, LOCAL_PATHS, safeNextPath } from '../src/gateway.ts'
 import { PasskeyService } from '../src/webauthn.ts'
 import { APP_JS } from '../src/pages.ts'
-import { TunnelManager, fingerprintMatches, hostKeyFingerprints, portAccepts, type TunnelManagerOptions } from '../src/tunnel.ts'
+import { TunnelManager, classifySshFailure, describeForwardFailure, fingerprintMatches, hostKeyFingerprints, portAccepts, type TunnelManagerOptions } from '../src/tunnel.ts'
+import { fuserProbeCommand, killCommand, parseFuserHolders, parseSshdHolders, planRelease, ssProbeCommand } from '../src/remote-release.ts'
 import { toBase64Url } from '../src/encoding.ts'
 import { apply, type ConnectionContext, type PluginContext } from '../src/index.ts'
 import { Config, provenance } from '../src/config.ts'
 import { qrDataUrl } from '../src/qr.ts'
 import {
-  ENROLL_MINT_PATH, PASSKEY_REMOVE_PATH, STATUS_PATH, TRUST_FORGET_PATH, registerRoutes,
+  ENROLL_MINT_PATH, PASSKEY_REMOVE_PATH, STATUS_PATH, TRUST_FORGET_PATH, TUNNEL_RELEASE_PATH, TUNNEL_RETRY_PATH, registerRoutes,
   type FetchRoute, type RouteSource,
 } from '../src/routes.ts'
 import { buildStatus, sshEquivalent } from '../src/status.ts'
@@ -216,6 +217,8 @@ function testConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
       keepaliveCountMax: 3,
       readyTimeoutMs: 2_000,
       reconnectMaxDelayMs: 50,
+      suspectedReconnectMaxDelayMs: 50,
+      releaseStaleForward: false,
       maxChannels: 8,
     },
     ...overrides,
@@ -254,9 +257,15 @@ interface HarnessContext {
  * can prove the plugin reads the live one rather than a string it baked in.
  * @param loader - the Host's Loader stand-in, when a check needs the plugin to
  * wait for boot; omitting it is a hand-built context, already fully mounted.
+ * @param services - extra Host services `ctx.get` should answer, e.g. the
+ * `webStartup` facts the fence message reads.
  * @returns the context, its captured lines, its registered effects, its routes, and the restore hook.
  */
-function harnessContext(token = 'test-process-token', loader?: { await(): Promise<unknown> }): HarnessContext {
+function harnessContext(
+  token = 'test-process-token',
+  loader?: { await(): Promise<unknown> },
+  services: Record<string, unknown> = {},
+): HarnessContext {
   const lines: string[] = []
   const effects: (() => void | Promise<void>)[] = []
   const routes: FetchRoute[] = []
@@ -265,7 +274,7 @@ function harnessContext(token = 'test-process-token', loader?: { await(): Promis
   const context: PluginContext = {
     effect: (body) => { effects.push(body()) },
     inject: (_names, callback) => { pending.push(callback); return undefined },
-    get: loader === undefined ? undefined : (name: string) => (name === 'loader' ? loader : undefined),
+    get: (name: string) => (name === 'loader' ? loader : services[name]),
   }
   return {
     context,
@@ -625,6 +634,12 @@ await check('a disabled tunnel does nothing and a missing key file fails the loa
     store: disabledStore,
   })
   await assert.rejects(() => missing.start(), /cannot read the SSH private key/)
+  // Terminal, and visible: a key that cannot be read is not a transient failure, so
+  // the state must say `failed` (not sit on `starting` forever) and carry the reason
+  // the page shows — the throw alone only reaches the caller's log.
+  assert.equal(missing.snapshot().state, 'failed')
+  assert.equal(missing.snapshot().kind, 'key')
+  assert.match(String(missing.snapshot().lastError), /absent-key/)
 })
 
 await check('a PKCS#8 key is named instead of surfacing ssh2 wording', async () => {
@@ -669,6 +684,127 @@ await check('a refused connection is retried instead of failing the plugin', asy
   assert.equal(snapshot.channels, 0)
   await manager.stop()
   assert.equal(manager.snapshot().state, 'stopped')
+})
+
+await check('every ssh2 failure is classified into something an operator can act on', () => {
+  // The page names the field to fix from this classification, so the mapping is the
+  // contract: an authentication rejection, a name that does not resolve, a refused
+  // socket, a handshake that never finished, and anything else kept honestly
+  // unknown rather than mislabeled into one of them.
+  assert.equal(classifySshFailure('client-authentication', 'All configured authentication methods failed'), 'auth')
+  assert.equal(classifySshFailure('agent', 'no agent'), 'auth')
+  assert.equal(classifySshFailure('client-dns', 'getaddrinfo ENOTFOUND vps.invalid'), 'dns')
+  assert.equal(classifySshFailure('client-socket', 'connect ECONNREFUSED 1.2.3.4:22'), 'unreachable')
+  assert.equal(classifySshFailure('client-socket', 'getaddrinfo ENOTFOUND vps.invalid'), 'dns')
+  assert.equal(classifySshFailure('client-timeout', 'Timed out while waiting for handshake'), 'handshake-timeout')
+  assert.equal(classifySshFailure('protocol', 'unexpected packet'), 'unknown')
+
+  // A port a previous session still holds is the failure with an exact remedy, so
+  // its sentence carries the remedy and not ssh2's "Unable to bind".
+  const forward = describeForwardFailure(3090, 'Unable to bind to 127.0.0.1:3090')
+  assert.match(forward, /127\.0\.0\.1:3090/)
+  assert.match(forward, /Unable to bind to 127\.0\.0\.1:3090/)
+  assert.match(forward, /sudo ss -ltnp \| grep 3090/)
+  assert.match(forward, /ClientAliveInterval 30/)
+})
+
+await check('the VPS-side release only ever targets a provable sshd on our own port', () => {
+  // Ending a process on someone else's server is the sharpest thing this plugin can
+  // do, so every shape that must do *nothing* is asserted, not just the happy one.
+  const one = 'LISTEN 0      128        127.0.0.1:3090      0.0.0.0:*    users:(("sshd",pid=1234,fd=3))'
+  const two = 'LISTEN 0 128 127.0.0.1:3090 0.0.0.0:* users:(("sshd",pid=99,fd=4),("sshd",pid=98,fd=5))'
+  assert.deepEqual(parseSshdHolders(one, 3090), [1234])
+  assert.deepEqual(parseSshdHolders(two, 3090), [99, 98])
+  // The negatives: another port, another address, another process, or no process
+  // column at all — a non-root tunnel user cannot see other users' pids.
+  assert.deepEqual(parseSshdHolders('LISTEN 0 128 127.0.0.1:3091 0.0.0.0:* users:(("sshd",pid=1234,fd=3))', 3090), [])
+  assert.deepEqual(parseSshdHolders('LISTEN 0 128 0.0.0.0:3090 0.0.0.0:* users:(("sshd",pid=1234,fd=3))', 3090), [])
+  assert.deepEqual(parseSshdHolders('LISTEN 0 128 127.0.0.1:3090 0.0.0.0:* users:(("nginx",pid=1234,fd=3))', 3090), [])
+  assert.deepEqual(parseSshdHolders('LISTEN 0 128 127.0.0.1:3090 0.0.0.0:*', 3090), [])
+
+  assert.deepEqual(planRelease(one, 3090), { kind: 'kill', pids: [1234] })
+  // Held, but by something this action will not end: report, never kill.
+  assert.deepEqual(planRelease('LISTEN 0 128 127.0.0.1:3090 0.0.0.0:*', 3090), { kind: 'cannot-see' })
+  assert.deepEqual(planRelease('LISTEN 0 128 127.0.0.1:3090 0.0.0.0:* users:(("nginx",pid=1,fd=3))', 3090), { kind: 'cannot-see' })
+  assert.deepEqual(planRelease('', 3090), { kind: 'nothing' })
+  assert.deepEqual(planRelease(null, 3090), { kind: 'unavailable' })
+
+  // `fuser` names pids but never process names, so it can only report.
+  assert.deepEqual(parseFuserHolders('3090/tcp:            1234 5678'), [1234, 5678])
+  assert.deepEqual(parseFuserHolders(''), [])
+  // Every command is fixed text with one validated integer in it.
+  assert.equal(ssProbeCommand(3090), "ss -ltnpH 'sport = :3090'")
+  assert.equal(fuserProbeCommand(3090), 'fuser -n tcp 3090 2>/dev/null')
+  assert.equal(killCommand(1234), 'kill 1234')
+})
+
+await check('repeated failures that never once succeeded are called a configuration problem, quietly', async () => {
+  const keyFile = join(workdir, 'id_ed25519-escalation')
+  const { private: openSshKey } = ssh2.utils.generateKeyPairSync('ed25519')
+  await writeFile(keyFile, openSshKey, 'utf8')
+  const store = new StateStore(join(workdir, 'escalation-state.json'))
+  await store.load()
+  // What the tunnel logged, so the throttling is asserted rather than described.
+  const logged: string[] = []
+  const capturing: Logger = {
+    info: () => {},
+    warn: line => { logged.push(String(line)) },
+    error: line => { logged.push(String(line)) },
+  }
+  const manager = new TunnelManager({
+    ...tunnelOptions({ enabled: true, port: 1, user: 'nobody', privateKeyFile: keyFile, reconnectMaxDelayMs: 20, suspectedReconnectMaxDelayMs: 20 }),
+    store,
+    log: capturing,
+  })
+  try {
+    await manager.start()
+    assert.ok(
+      await until(() => manager.snapshot().attempts >= 12, 10_000),
+      `the tunnel never reached twelve attempts: ${JSON.stringify(manager.snapshot())}`,
+    )
+    const snapshot = manager.snapshot()
+    assert.equal(snapshot.everListening, false)
+    assert.equal(snapshot.kind, 'unreachable')
+    // Never once up, and five attempts deep: the page must stop saying "reconnecting"
+    // and point at the two fields that can produce this.
+    assert.equal(snapshot.suspected, 'configuration')
+    assert.ok(snapshot.nextRetryAt !== null && snapshot.nextRetryAt > Date.now() - 1_000, JSON.stringify(snapshot))
+    // Twelve failures, at most three console lines: one full line the first time,
+    // then only every tenth attempt. Forty identical lines hide the one that matters.
+    const lost = logged.filter(line => line.includes('tunnel lost'))
+    assert.ok(lost.length <= 3, `${String(lost.length)} lines for ${String(snapshot.attempts)} attempts:\n${logged.join('\n')}`)
+    assert.ok(lost.length >= 1, `a failure must still be reported once:\n${logged.join('\n')}`)
+    assert.ok(lost.some(line => line.includes('looks like a configuration problem')), logged.join('\n'))
+  } finally {
+    await manager.stop()
+  }
+})
+
+await check('a retry after a failure forgets the previous reason instead of presenting it', async () => {
+  // "Retry now" and 「重新信任」 both stop and start the manager; a fresh attempt
+  // showing the previous attempt's `lastError` would read as a failure that has not
+  // happened yet.
+  const keyFile = join(workdir, 'id_ed25519-retry')
+  const { private: openSshKey } = ssh2.utils.generateKeyPairSync('ed25519')
+  await writeFile(keyFile, openSshKey, 'utf8')
+  const store = new StateStore(join(workdir, 'retry-clear-state.json'))
+  await store.load()
+  const manager = new TunnelManager({
+    ...tunnelOptions({ enabled: true, port: 1, user: 'nobody', privateKeyFile: keyFile, reconnectMaxDelayMs: 20, suspectedReconnectMaxDelayMs: 20 }),
+    store,
+  })
+  try {
+    await manager.start()
+    assert.ok(await until(() => manager.snapshot().kind !== null), `no failure was recorded: ${JSON.stringify(manager.snapshot())}`)
+    await manager.stop()
+    await manager.start()
+    const fresh = manager.snapshot()
+    assert.equal(fresh.kind, null, JSON.stringify(fresh))
+    assert.equal(fresh.lastError, null, JSON.stringify(fresh))
+    assert.equal(fresh.attempts, 0, JSON.stringify(fresh))
+  } finally {
+    await manager.stop()
+  }
 })
 
 await check('portAccepts tells an open port from a refused one', async () => {
@@ -1116,8 +1252,11 @@ await check('the plugin row Config is a form the settings service can render', (
     for (const [key, child] of Object.entries(node.dict ?? {})) walk(child, [...path, key])
   }
   walk(Config as unknown as SchemaNode, [])
-  assert.equal(live.length, 10, `every editable field must be volatile; got ${live.join(', ')}`)
+  assert.equal(live.length, 11, `every editable field must be volatile; got ${live.join(', ')}`)
   assert.ok(live.includes('tunnel.privateKeyFile'))
+  // The opt-in that lets the plugin act on the VPS is an editable field like any
+  // other: it must ride the same volatile path, so turning it on restarts the row.
+  assert.ok(live.includes('tunnel.releaseStaleForward'))
   assert.deepEqual(secrets, ['tunnel.passphrase'], 'the key passphrase never rides to the browser')
   // The fields the operator must not set are not fields: the bind address, the
   // state file, the RP ID and RP name, the local DSH URL, the VPS-side bind, and
@@ -1200,7 +1339,7 @@ await check('the settings status payload carries the state, the devices, and no 
     hostKey: 'SHA256:pinned',
     passkeys: [{ id: 'cred-1', label: 'phone', createdAt: 1, lastUsedAt: 2, deviceType: 'multiDevice', backedUp: true }],
     gatewayListening: true,
-    tunnel: { state: 'listening', attempts: 1, channels: 2, since: 0, remote: 'vps:22', hostKey: 'SHA256:x', lastError: null },
+    tunnel: { state: 'listening', kind: null, attempts: 1, channels: 2, since: 0, everListening: true, nextRetryAt: null, suspected: null, remote: 'vps:22', hostKey: 'SHA256:x', lastError: null },
     fence: { authority: 'dsh.example.test', status: 401 },
   })
   assert.equal(payload.configured, true)
@@ -1243,12 +1382,17 @@ await check('the settings status payload carries the state, the devices, and no 
     hostKey: null,
     passkeys: [],
     gatewayListening: true,
-    tunnel: { state: 'reconnecting', attempts: 9, channels: 0, since: 0, remote: 'vps:3090', hostKey: null, lastError: 'connect ECONNREFUSED 1.2.3.4:3090' },
+    tunnel: { state: 'reconnecting', kind: 'unreachable', attempts: 9, channels: 0, since: 0, everListening: false, nextRetryAt: 12_345, suspected: 'configuration', remote: 'vps:3090', hostKey: null, lastError: 'connect ECONNREFUSED 1.2.3.4:3090' },
     fence: null,
   })
   assert.equal(failingTunnel.runtime.tunnel?.state, 'reconnecting')
   assert.equal(failingTunnel.runtime.tunnel?.remote, 'vps:3090')
   assert.match(String(failingTunnel.runtime.tunnel?.lastError), /ECONNREFUSED/)
+  // The classification and its consequences ride the payload: the page needs the
+  // kind to say *what* to fix, and `suspected` to stop saying "reconnecting" about
+  // a deployment that has never once been up.
+  assert.equal(failingTunnel.runtime.tunnel?.kind, 'unreachable')
+  assert.equal(failingTunnel.runtime.tunnel?.suspected, 'configuration')
 
   // The equivalent `ssh -R` line, so the port mapping is checkable without
   // reading any code — this is the very command a deployment reasons about.
@@ -1284,6 +1428,8 @@ await check('the settings routes answer JSON and refuse bad writes', async () =>
   let removed: string[] = []
   let minted = 0
   let forgotten = 0
+  let retried = 0
+  let released = 0
   const source: RouteSource = {
     status: () => buildStatus({
       configured: true, resolved: null, sources: {}, configError: 'publicOrigin is not an absolute URL',
@@ -1303,11 +1449,19 @@ await check('the settings routes answer JSON and refuse bad writes', async () =>
       forgotten += 1
       return { ok: true }
     },
+    retryTunnel: async () => {
+      retried += 1
+      return { ok: true }
+    },
+    releaseStaleForward: async () => {
+      released += 1
+      return { ok: true, detail: 'ended sshd pid(s) 1234' }
+    },
   }
   registerRoutes({ register: (route) => { registered.push(route) } }, source, silentLog)
   assert.deepEqual(
     registered.map(route => route.path).sort(),
-    [STATUS_PATH, PASSKEY_REMOVE_PATH, ENROLL_MINT_PATH, TRUST_FORGET_PATH].sort(),
+    [STATUS_PATH, PASSKEY_REMOVE_PATH, ENROLL_MINT_PATH, TRUST_FORGET_PATH, TUNNEL_RETRY_PATH, TUNNEL_RELEASE_PATH].sort(),
   )
   const statusRoute = registered.find(route => route.path === STATUS_PATH)
   const removeRoute = registered.find(route => route.path === PASSKEY_REMOVE_PATH)
@@ -1347,22 +1501,51 @@ await check('the settings routes answer JSON and refuse bad writes', async () =>
   assert.equal(forget.status, 200)
   assert.equal(forgotten, 1)
 
+  const retryRoute = registered.find(route => route.path === TUNNEL_RETRY_PATH)
+  assert.ok(retryRoute !== undefined)
+  const retry = await retryRoute.fetch(new Request(`https://dsh.example.test${TUNNEL_RETRY_PATH}`, { method: 'POST' }))
+  assert.equal(retry.status, 200)
+  assert.equal(retried, 1)
+
+  const releaseRoute = registered.find(route => route.path === TUNNEL_RELEASE_PATH)
+  assert.ok(releaseRoute !== undefined)
+  const release = await releaseRoute.fetch(new Request(`https://dsh.example.test${TUNNEL_RELEASE_PATH}`, { method: 'POST' }))
+  assert.equal(release.status, 200)
+  assert.equal(released, 1)
+  // The detail is the whole point of the answer: "released" without what was ended
+  // would be unauditable.
+  assert.match(JSON.stringify(await release.json()), /ended sshd pid\(s\) 1234/)
+
   const failing: RouteSource = {
     status: () => { throw new Error('boom') },
     removePasskey: async () => ({ ok: true }),
     mintEnrollment: async () => ({ ok: false, reason: 'the gateway is not running' }),
     forgetHostKey: async () => ({ ok: false, reason: 'nothing is pinned' }),
+    retryTunnel: async () => ({ ok: false, reason: 'the GUI refuses this authority' }),
+    releaseStaleForward: async () => ({ ok: false, reason: 'unavailable: this row does not allow it' }),
   }
   const captured: FetchRoute[] = []
   registerRoutes({ register: (route) => { captured.push(route) } }, failing, silentLog)
   const failingStatus = captured.find(route => route.path === STATUS_PATH)
   const failingMint = captured.find(route => route.path === ENROLL_MINT_PATH)
   const failingForget = captured.find(route => route.path === TRUST_FORGET_PATH)
-  assert.ok(failingStatus !== undefined && failingMint !== undefined && failingForget !== undefined)
+  const failingRetry = captured.find(route => route.path === TUNNEL_RETRY_PATH)
+  assert.ok(failingStatus !== undefined && failingMint !== undefined && failingForget !== undefined && failingRetry !== undefined)
   assert.equal((await failingStatus.fetch(new Request(`https://x${STATUS_PATH}`))).status, 500)
   // A refusal is the caller's answer, not a server error.
   assert.equal((await failingMint.fetch(new Request(`https://x${ENROLL_MINT_PATH}`, { method: 'POST' }))).status, 409)
   assert.equal((await failingForget.fetch(new Request(`https://x${TRUST_FORGET_PATH}`, { method: 'POST' }))).status, 409)
+  // "You may not retry this" is a state the page renders (the fence still refuses),
+  // so it is a 409 with the reason, never a 500.
+  const refusedRetry = await failingRetry.fetch(new Request(`https://x${TUNNEL_RETRY_PATH}`, { method: 'POST' }))
+  assert.equal(refusedRetry.status, 409)
+  assert.match(JSON.stringify(await refusedRetry.json()), /refuses this authority/)
+
+  const failingRelease = captured.find(route => route.path === TUNNEL_RELEASE_PATH)
+  assert.ok(failingRelease !== undefined)
+  const refusedRelease = await failingRelease.fetch(new Request(`https://x${TUNNEL_RELEASE_PATH}`, { method: 'POST' }))
+  assert.equal(refusedRelease.status, 409, 'a release the row does not allow is a refusal, not a server error')
+  assert.match(JSON.stringify(await refusedRelease.json()), /does not allow it/)
 })
 
 await check('apply() boots the gateway and mints one first-run enrollment link', async () => {
@@ -1599,7 +1782,7 @@ await check('apply() stays idle when no public origin is configured', async () =
     assert.equal(effects.length, 0)
     connect()
     assert.deepEqual(routes.map(route => route.path).sort(),
-      [STATUS_PATH, PASSKEY_REMOVE_PATH, ENROLL_MINT_PATH, TRUST_FORGET_PATH].sort(),
+      [STATUS_PATH, PASSKEY_REMOVE_PATH, ENROLL_MINT_PATH, TRUST_FORGET_PATH, TUNNEL_RETRY_PATH, TUNNEL_RELEASE_PATH].sort(),
       'the settings routes are registered even while nothing serves')
     assert.ok(lines.some(line => line.includes('public access stays off')), lines.join('\n'))
     // Nothing serves yet, so there is no local entry line to add either.
@@ -1674,7 +1857,7 @@ await check('apply() wires the settings routes and the sign-in redirect to a con
     )
     assert.deepEqual(authBases, [`http://127.0.0.1:${String(upstreamPort)}/`])
     assert.deepEqual(routes.map(route => route.path).sort(),
-      [STATUS_PATH, PASSKEY_REMOVE_PATH, ENROLL_MINT_PATH, TRUST_FORGET_PATH].sort())
+      [STATUS_PATH, PASSKEY_REMOVE_PATH, ENROLL_MINT_PATH, TRUST_FORGET_PATH, TUNNEL_RETRY_PATH, TUNNEL_RELEASE_PATH].sort())
     // This instance has its own state file (its own home), so its session is
     // minted from that secret rather than the main harness one.
     const ownSecret = (await loadState(join(home, '.dsh', 'dsh-sync-remote', 'state.json'))).secret
@@ -1846,7 +2029,13 @@ await check('a refused fence closes the tunnel before it ever opens', async () =
   // The proof that `TunnelManager.start()` was never reached is the key file:
   // this row names one that does not exist, so any path that reaches `start()`
   // must log the read failure. A blocked gate logs no such line.
-  const refused = createServer((_req, res) => {
+  //
+  // The stand-in also records the Host it was asked about: the fence is the only
+  // thing that decides, and it must be asked about the authority *browsers* use
+  // (the row's public origin), not about "some authority is configured".
+  let probedHost: string | undefined
+  const refused = createServer((req, res) => {
+    probedHost = req.headers.host
     res.writeHead(403, { 'content-type': 'text/plain' })
     res.end('forbidden')
   })
@@ -1878,6 +2067,10 @@ await check('a refused fence closes the tunnel before it ever opens', async () =
       `the tunnel must never be started when the fence refuses:\n${lines.join('\n')}`,
     )
     assert.match(lines.find(line => line.includes('the reverse tunnel stays closed')) ?? '', /--trusted-host "dsh\.example\.test"/)
+    // A `--trusted-host` naming a different host is the same refusal: the probe
+    // asks about this row's public origin, so an authority that is not it is
+    // simply not trusted.
+    assert.equal(probedHost, 'dsh.example.test', 'the fence must be asked about the authority browsers use')
 
     connect()
     const statusRoute = routes.find(route => route.path === STATUS_PATH)
@@ -1981,6 +2174,49 @@ await check('an indeterminate fence answer is re-asked before it blocks', async 
   }
 })
 
+await check('a trusted host that is not this deployment is named in the refusal', async () => {
+  // The exact mistake behind this check: `--trusted-host` *was* passed, but with a
+  // different host. The fence still answers 403 and the tunnel still stays closed —
+  // and the message has to say which authorities the GUI actually trusts, instead
+  // of repeating "add --trusted-host" at an operator who already did.
+  const refused = createServer((_req, res) => {
+    res.writeHead(403, { 'content-type': 'text/plain' })
+    res.end('forbidden')
+  })
+  const refusedPort = await listen(refused)
+  const freePort = await serverPortForTest()
+  const home = join(workdir, 'home-fence-wrong-trust')
+  const { context, lines, effects, release } = harnessContext('test-process-token', undefined, {
+    webStartup: { trustedHosts: ['other.example.test', 'lab.internal'], publicUrl: 'https://other.example.test' },
+  })
+  /** @returns whether the captured console carries `text`. */
+  const printed = (text: string): boolean => lines.some(line => line.includes(text))
+  try {
+    await withEnv({ USERPROFILE: home, HOME: home }, async () => {
+      await apply(context, {
+        publicOrigin: 'https://dsh.example.test',
+        serverPort: freePort,
+        clientPort: refusedPort,
+        sessionTtlHours: 24,
+        tunnel: { enabled: true, host: '127.0.0.1', port: 1, user: 'root', privateKeyFile: join(home, 'absent-key') },
+      })
+    })
+    assert.ok(await until(() => printed('the reverse tunnel stays closed')), lines.join('\n'))
+    const line = lines.find(candidate => candidate.includes('the reverse tunnel stays closed')) ?? ''
+    assert.match(line, /"other\.example\.test", "lab\.internal"/, line)
+    assert.match(line, /not the authority browsers use here/, line)
+    // `--public-url` is advertising, not trust: a mismatch earns one warning, never
+    // a refusal (the tunnel's gate is the probe and nothing else).
+    assert.ok(printed('dsh web advertises'), lines.join('\n'))
+    assert.equal(printed('cannot read the SSH private key'), false, lines.join('\n'))
+  } finally {
+    for (const dispose of effects) await dispose()
+    release()
+    refused.closeAllConnections()
+    refused.close()
+  }
+})
+
 await gateway.close()
 // The proxy leaves pooled upstream connections open on purpose; close them
 // explicitly or the stand-in server waits forever and the process never exits.
@@ -2059,7 +2295,7 @@ await check('the client bundle names exactly the Host routes that exist', async 
   // connects the two, so this is what connects them: rename a route on one side
   // and the settings page would 404 in silence.
   const bundle = await readFile(join(process.cwd(), 'lib/client.js'), 'utf8')
-  const declared = new Set([STATUS_PATH, ENROLL_MINT_PATH, PASSKEY_REMOVE_PATH, TRUST_FORGET_PATH])
+  const declared = new Set([STATUS_PATH, ENROLL_MINT_PATH, PASSKEY_REMOVE_PATH, TRUST_FORGET_PATH, TUNNEL_RETRY_PATH, TUNNEL_RELEASE_PATH])
   const named = new Set([...bundle.matchAll(/\/api\/sync-remote\.[A-Za-z.]+/gu)].map(match => match[0]))
   assert.ok(named.size >= declared.size, `the bundle should talk to every route: ${[...named].join(', ')}`)
   for (const route of named) {

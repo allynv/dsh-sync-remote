@@ -30,6 +30,12 @@ export const ENROLL_MINT_PATH = '/api/sync-remote.enroll.mint'
 /** Exact path that forgets the pinned SSH host key. */
 export const TRUST_FORGET_PATH = '/api/sync-remote.trust.forget'
 
+/** Exact path that re-dials the tunnel now, instead of waiting out the backoff. */
+export const TUNNEL_RETRY_PATH = '/api/sync-remote.tunnel.retry'
+
+/** Exact path that ends an sshd on the VPS still holding the tunnel port (opt-in). */
+export const TUNNEL_RELEASE_PATH = '/api/sync-remote.tunnel.release'
+
 /** One exact Fetch route, in the shape `ctx.connection.fetch.register` takes. */
 export interface FetchRoute {
   path: string
@@ -63,6 +69,24 @@ export interface RouteSource {
    * @returns whether it was forgotten, or why it was not.
    */
   forgetHostKey(): Promise<{ ok: true } | { ok: false; reason: string }>
+  /**
+   * Re-dial the tunnel immediately, through the same fence gate as the boot path.
+   *
+   * The operator needs this after fixing something the plugin cannot see (a VPS
+   * that was down, a port a stale session held): without it the next attempt is up
+   * to five minutes away, and a reload of the row would be the only way out.
+   * @returns whether an attempt was started, or why it was not.
+   */
+  retryTunnel(): Promise<{ ok: true } | { ok: false; reason: string }>
+  /**
+   * End an sshd on the VPS that still holds the tunnel port.
+   *
+   * The only action this plugin may take on the VPS, and it is off unless the row
+   * allows it. The Host refuses rather than approximating when it is off, when the
+   * holder is not a provable sshd, or when the port is already free.
+   * @returns what happened, or why nothing was done.
+   */
+  releaseStaleForward(): Promise<{ ok: true; detail: string } | { ok: false; reason: string }>
 }
 
 /**
@@ -154,6 +178,40 @@ export function registerRoutes(registry: RouteRegistry, source: RouteSource, log
         const reason = error instanceof Error ? error.message : String(error)
         log.error(`dsh-sync-remote: forgetting the pinned host key failed: ${reason}`)
         return json({ error: 'forgetting the pinned host key failed; see the DSH log' }, 500)
+      }
+    },
+  })
+
+  registry.register({
+    path: TUNNEL_RETRY_PATH,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async () => {
+      try {
+        const result = await source.retryTunnel()
+        // 409, not 500: "you may not retry this" is a state the page renders, not a
+        // failure it has to interpret.
+        return result.ok ? json({ ok: true }) : json({ error: result.reason }, 409)
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        log.error(`dsh-sync-remote: retrying the tunnel failed: ${reason}`)
+        return json({ error: 'the retry failed; see the DSH log' }, 500)
+      }
+    },
+  })
+
+  registry.register({
+    path: TUNNEL_RELEASE_PATH,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async () => {
+      try {
+        const result = await source.releaseStaleForward()
+        return result.ok ? json({ ok: true, detail: result.detail }) : json({ error: result.reason }, 409)
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        log.error(`dsh-sync-remote: releasing the VPS-side listener failed: ${reason}`)
+        return json({ error: 'releasing the VPS-side listener failed; see the DSH log' }, 500)
       }
     },
   })

@@ -72,15 +72,77 @@ const FENCE_CONFIRM_ATTEMPTS = 3
 const FENCE_CONFIRM_DELAY_MS = 500
 
 /**
+ * What DSH itself was launched with: the `trustedHosts` and `publicUrl` from
+ * `dsh web --trusted-host … --public-url …`.
+ */
+export interface LaunchFacts {
+  /** Authorities `--trusted-host` declared, in argument order. */
+  trustedHosts: string[]
+  /** The advertised public root from `--public-url`, or null when it was not given. */
+  publicUrl: string | null
+}
+
+/**
+ * Read what the GUI was launched with, when the Host can say.
+ *
+ * The fence probe answers the operative question — does the fence accept the
+ * authority browsers use? — and stays the only thing the tunnel's gate consults.
+ * This is context for the *message*: without it a 403 can only say "add
+ * `--trusted-host`", while with it the plugin can name the authority it asked
+ * about *and* the authorities the GUI actually trusts, which is the difference
+ * between a hint and a diagnosis.
+ *
+ * Read structurally and treated as optional on purpose: this bundle ships no
+ * dependency on the Harness packages, and a Host that does not expose the service
+ * may only cost the sharper wording, never the gate.
+ * @param ctx - Host plugin context.
+ * @returns the launch facts, or null when the Host cannot report them.
+ */
+export function readLaunchFacts(ctx: PluginContext): LaunchFacts | null {
+  const raw = ctx.get?.('webStartup')
+  if (typeof raw !== 'object' || raw === null) return null
+  const candidate = raw as { trustedHosts?: unknown, publicUrl?: unknown }
+  if (!Array.isArray(candidate.trustedHosts)) return null
+  return {
+    trustedHosts: candidate.trustedHosts.filter((entry): entry is string => typeof entry === 'string'),
+    publicUrl: typeof candidate.publicUrl === 'string' ? candidate.publicUrl : null,
+  }
+}
+
+/**
+ * The clause that turns "the fence refused this Host" into a diagnosis.
+ *
+ * `--trusted-host` must name the authority browsers actually send, so the two
+ * ways to get it wrong are "a different host" and "the right host spelled with a
+ * port the browser never sends" — and the launch facts also name the one case
+ * this plugin cannot otherwise see: a fence that refuses an authority its own
+ * launch arguments declare as trusted.
+ * @param authority - the authority the fence was asked about.
+ * @param launch - what the GUI was launched with, or null when unknown.
+ * @returns one clause to append, or an empty string when there is nothing to add.
+ */
+function fenceDiagnosis(authority: string, launch: LaunchFacts | null): string {
+  if (launch === null || launch.trustedHosts.length === 0) {
+    return ' (dsh web was started without --trusted-host)'
+  }
+  const listed = launch.trustedHosts.map(entry => JSON.stringify(entry)).join(', ')
+  if (launch.trustedHosts.some(entry => entry.toLowerCase() === authority.toLowerCase())) {
+    return ` — dsh web declares --trusted-host ${listed}, which names this authority, so check the spelling and any extra port (a port in an entry has to match the browser's Host exactly), or whether another dsh web answers on this port`
+  }
+  return ` — dsh web trusts ${listed}, which is not the authority browsers use here; add ${JSON.stringify(authority)} to --trusted-host, or set this plugin's public origin to one of those`
+}
+
+/**
  * The one sentence that tells an operator how to make this deployment servable.
  * @param authority - the public authority browsers use.
  * @param origin - the configured public origin.
+ * @param launch - what the GUI was launched with, or null when unknown.
  * @returns the fix, in the terms of the `dsh web` invocation.
  */
-function fenceFix(authority: string, origin: string): string {
+function fenceFix(authority: string, origin: string, launch: LaunchFacts | null): string {
   return `the DSH browser-trust fence refused Host ${JSON.stringify(authority)}; `
     + `start the GUI with --trusted-host ${JSON.stringify(authority)} (and --public-url ${origin}/), `
-    + 'or every request through this gateway will 403'
+    + `or every request through this gateway will 403${fenceDiagnosis(authority, launch)}`
 }
 
 /**
@@ -215,12 +277,22 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
   // `warn` rather than an `info` for the same reason — the console carries what
   // a human has to act on, and this row is waiting on exactly that.
   const configured = provenance(row).publicOrigin !== 'unset'
+  // What the GUI was launched with, when it can say: context for the refusal
+  // messages below, never an input to the decision (that is the probe's job).
+  const launch = readLaunchFacts(ctx)
   if (!configured) {
     log.warn('dsh-sync-remote: no public origin configured yet; set it in Settings → Remote access; public access stays off')
   } else if (statusError !== null) {
     log.error(`dsh-sync-remote: refusing to serve until the configuration is fixed: ${statusError}`)
   } else if (resolved !== null) {
     log.info(`dsh-sync-remote: ${JSON.stringify(describeConfig(resolved))}`)
+    // `--public-url` is advertising, not trust: it names the address DSH prints
+    // and opens. When it differs from the origin this plugin publishes, the two
+    // halves of one deployment disagree about the address browsers should use.
+    const advertised = launch?.publicUrl?.replace(/\/+$/u, '')
+    if (advertised !== undefined && advertised !== resolved.publicOrigin.replace(/\/+$/u, '')) {
+      log.warn(`dsh-sync-remote: dsh web advertises ${advertised}, but this plugin publishes ${resolved.publicOrigin}; browsers have to use the plugin's origin, because that is the authority the tunnel's fence check asks about`)
+    }
   }
 
   let store: StateStore | null = null
@@ -335,7 +407,7 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
      */
     const reportFence = (answer: PreflightResult): void => {
       if (answer.status === 403) {
-        log.error(`dsh-sync-remote: ${fenceFix(answer.authority, settings.publicOrigin)}`)
+        log.error(`dsh-sync-remote: ${fenceFix(answer.authority, settings.publicOrigin, launch)}`)
       } else if (answer.status === 0) {
         log.warn(`dsh-sync-remote: the local DSH Web server at http://${settings.target.host}:${String(settings.target.port)} did not answer (${answer.error ?? 'no response'}); start it with dsh web`)
       } else if (answer.status === 401) {
@@ -384,7 +456,7 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
       // failing to answer the question at all. Both are refusals to open a tunnel,
       // and the sentence differs only in what it tells the operator to look at.
       const why = answer.status === 403
-        ? `${fenceFix(answer.authority, settings.publicOrigin)} — the reverse tunnel stays closed until then`
+        ? `${fenceFix(answer.authority, settings.publicOrigin, launch)} — the reverse tunnel stays closed until then`
         : `the local GUI did not confirm it accepts Host ${JSON.stringify(answer.authority)}`
           + `${answer.status === 0 ? ` (${answer.error ?? 'no response'})` : ` (HTTP ${String(answer.status)})`}`
           + '; the reverse tunnel stays closed until its /api answers 401'
@@ -504,6 +576,38 @@ export async function apply(ctx: PluginContext, config?: RowConfig): Promise<voi
           if (startTunnel !== null) await startTunnel()
         }
         return { ok: true }
+      },
+      retryTunnel: async () => {
+        if (tunnel === null || startTunnel === null) {
+          return { ok: false, reason: 'no tunnel is configured, so there is nothing to retry' }
+        }
+        // Deliberately the same path the boot uses: stop, then the fence-checked
+        // starter. A retry button must never be a way around the gate.
+        await tunnel.stop()
+        await startTunnel()
+        const after = tunnel.snapshot()
+        if (after.state === 'blocked') {
+          return { ok: false, reason: after.lastError ?? 'the GUI refuses this authority, so no tunnel was opened' }
+        }
+        if (after.state === 'failed') {
+          return { ok: false, reason: after.lastError ?? 'the tunnel refused to start' }
+        }
+        return { ok: true }
+      },
+      releaseStaleForward: async () => {
+        if (tunnel === null) {
+          return { ok: false, reason: 'no tunnel is configured, so there is no remote listener to look for' }
+        }
+        if (resolved === null || !resolved.tunnel.releaseStaleForward) {
+          return { ok: false, reason: 'this row does not allow releasing the VPS-side listener; turn on "tunnel.releaseStaleForward" first' }
+        }
+        const result = await tunnel.releaseStaleForward()
+        // Only a proven holder that is now gone counts as done. Everything else is
+        // the operator's next step, and reporting it as success would hide a port
+        // that is still held.
+        return result.outcome === 'released' || result.outcome === 'nothing-held'
+          ? { ok: true, detail: result.detail }
+          : { ok: false, reason: `${result.outcome}: ${result.detail}` }
       },
     }
     ctx.inject(['connection'], (connectionCtx) => {

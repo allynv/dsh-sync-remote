@@ -155,6 +155,9 @@ export function buildStatus(input: StatusInput): SyncRemoteStatus {
     }
     effective['tunnel.user'] = resolved.tunnel.user
     effective['tunnel.privateKeyFile'] = resolved.tunnel.privateKeyFile
+    // The page needs this one to decide whether to offer the release action at all:
+    // it is the row's own opt-in, never a capability the page may assume.
+    effective['tunnel.releaseStaleForward'] = resolved.tunnel.releaseStaleForward
   }
   return {
     configured: input.configured,

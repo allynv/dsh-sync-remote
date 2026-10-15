@@ -51,6 +51,54 @@ interface Window {
 declare const styles: { insert(css: string): () => void } | undefined
 
 /**
+ * Whether a WHATWG URL hostname names the local loopback authority.
+ *
+ * Deliberately a copy of DSH's own predicate
+ * (`packages/client/connection/src/loopback-hostname.ts`): this file is a classic
+ * script with no module graph, so it cannot import it — and the page's write rule
+ * must agree with the Host's idea of "the operator's own machine" instead of
+ * inventing a second one.
+ * @param hostname - a page authority's hostname (IPv6 literals keep their brackets).
+ * @returns true for localhost, IPv6 loopback, or any IPv4 address in 127/8.
+ */
+function isLoopbackHostname(hostname: string): boolean {
+  if (hostname === 'localhost' || hostname === '[::1]') return true
+  const parts = hostname.split('.')
+  return parts.length === 4
+    && parts[0] === '127'
+    && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+}
+
+/**
+ * Whether this page is running on the operator's own machine — the only place
+ * the configuration may be edited from.
+ *
+ * A page with no location at all (a non-browser host, a test bench) is NOT
+ * loopback: this predicate grants a write capability, so its default has to be
+ * the closed one.
+ * @returns true only for a loopback page authority.
+ */
+function isLoopbackPage(): boolean {
+  const location = (window as { location?: { hostname?: string } }).location
+  const hostname = location?.hostname
+  return hostname !== undefined && hostname !== '' && isLoopbackHostname(hostname)
+}
+
+/**
+ * The authority of an absolute URL, spelled the way a browser sends it in `Host`.
+ * @param url - a configured public origin.
+ * @returns `host[:port]`, or null when the text is not an absolute URL.
+ */
+function hostOf(url: string): string | null {
+  try {
+    const parsed = new URL(url)
+    return parsed.host === '' ? null : parsed.host
+  } catch {
+    return null
+  }
+}
+
+/**
  * One path-addressed settings edit.
  */
 interface PathOp {
@@ -69,7 +117,6 @@ interface FormSnapshot {
   user: unknown
   revision: number | undefined
   writable: boolean
-  mode: 'host' | 'memory'
 }
 
 /**
@@ -117,7 +164,21 @@ interface Status {
   passkeys: PasskeyView[]
   runtime: {
     gateway: 'listening' | 'off'
-    tunnel: { state: string, attempts: number, channels: number, remote: string | null, hostKey: string | null, lastError: string | null } | null
+    tunnel: {
+      state: string
+      /** Why it is not up; see `TunnelFailureKind` on the Host half. */
+      kind: string | null
+      attempts: number
+      channels: number
+      remote: string | null
+      hostKey: string | null
+      /** Whether this deployment has ever been up: it decides what "failing" means. */
+      everListening: boolean
+      nextRetryAt: number | null
+      /** Non-null once repeated failures have never once succeeded. */
+      suspected: 'configuration' | null
+      lastError: string | null
+    } | null
     fence: { authority: string, status: number, ok: boolean } | null
   }
 }
@@ -221,6 +282,8 @@ window.__ModuleLoader__.load({
     const MINT_PATH = '/api/sync-remote.enroll.mint'
     const REMOVE_PATH = '/api/sync-remote.passkey.remove'
     const FORGET_PATH = '/api/sync-remote.trust.forget'
+    const RETRY_PATH = '/api/sync-remote.tunnel.retry'
+    const RELEASE_PATH = '/api/sync-remote.tunnel.release'
 
     const zh = {
       nav: '远程访问',
@@ -232,8 +295,12 @@ window.__ModuleLoader__.load({
       reset: '恢复默认',
       saved: '已保存；插件行正在重启，状态会自动刷新。',
       saveFailed: '保存被拒绝；请检查下面的提示。',
-      readOnly: '当前连接不允许写入（仅本机回环浏览器可以编辑）。',
+      readOnly: '本页只读：请在运行 DSH 的这台机器上用 http://127.0.0.1:<本机 DSH 端口> 打开本页编辑（公网地址只读）。用 ssh -L 把该端口转发到本机也算回环。',
       unavailable: '插件行当前未激活，因此该命名空间不可写。请用配置文件修正后重启 DSH。',
+      notWritable: 'Host 的配置文档当前不接受写入，无法保存。请检查 DSH 是否有写权限（或用配置文件手改）。',
+      loadingRow: '正在读取配置…稍等一下；若一直停在这里，请刷新页面。',
+      badValue: '配置没有通过 Host 的校验，所以这里不能编辑。看一眼 DSH 日志里的报错，或直接改配置文件。',
+      hostMismatch: '你正用 {here} 访问本页，但插件发布的公网地址是 {published}。两者不一致：浏览器实际用的那个 authority 也必须写进 dsh web 的 --trusted-host，否则用发布地址访问会一片 403。',
       needOrigin: '还没填公网地址。在下面填好「公网地址」并保存，公网入口就会开启（本机 127.0.0.1 的 GUI 不受影响）。',
       gateway: '网关',
       tunnel: '隧道',
@@ -246,6 +313,22 @@ window.__ModuleLoader__.load({
       tunnelFailedHint: '上面是 ssh2 报的原始原因（例如 ECONNREFUSED 表示主机/端口不对）。改完保存即可重试。',
       tunnelBlocked: '隧道没有开启：DSH 的信任围栏不接受这个域名。',
       tunnelBlockedHint: '用 dsh --profile web --public-url <公网地址>/ --trusted-host <域名> 重启 DSH 即可。在它接受之前，公网入口不会打开（不是故障，是刻意不开）。',
+      retry: '立即重试',
+      retrying: '重试中…',
+      retryStarted: '已重新发起连接；状态稍后自动刷新。',
+      retryFailed: '重试没有成功：',
+      nextRetry: '下次重试',
+      suspectedConfig: '连续多次失败、而且一次都没成功过：请重点检查「VPS 地址」与「VPS 的 SSH 端口」。退避已放慢到 5 分钟，改完保存或点「立即重试」。',
+      hintKey: '私钥读不到或格式不支持：改「私钥绝对路径」，或重新生成一把（只支持 OpenSSH、PKCS#1、SEC1、PuTTY PPK）。',
+      hintAuth: 'SSH 认证被拒：检查「SSH 用户」、私钥是否与该用户配对、以及私钥口令。',
+      hintHostKey: 'VPS 的主机密钥和已固定的不一致：确认这是你重装/换机后的 VPS，再点下面「重新信任」。',
+      hintForward: 'VPS 拒绝监听隧道端口：多半是上一次会话没有释放。按提示在 VPS 上查明并结束占用进程，然后点「立即重试」。',
+      hintConfig: '连不上 VPS：检查「VPS 地址」「VPS 的 SSH 端口」，以及 VPS 是否在运行、防火墙/安全组是否放行。',
+      hintDropped: '隧道断开（VPS 重启或网络中断）：会自动重连，期间公网返回 502。',
+      release: '释放 VPS 端口',
+      releasing: '释放中…',
+      releaseDone: '已释放：',
+      releaseFailed: '没能释放：',
       groupBasic: '基本',
       groupTunnel: 'SSH 反向隧道',
       infoTitle: '固定值（不可修改）',
@@ -318,8 +401,12 @@ window.__ModuleLoader__.load({
       reset: 'Reset',
       saved: 'Saved; the plugin row is restarting and the status refreshes by itself.',
       saveFailed: 'The write was refused; see the field messages below.',
-      readOnly: 'This connection may not write (only a loopback browser can edit).',
+      readOnly: 'This page is read-only: open it as http://127.0.0.1:<local DSH port> on the machine running DSH to edit (the public address stays read-only). An ssh -L forward of that port to your machine counts as loopback too.',
       unavailable: 'The plugin row is not active, so its namespace is not writable. Fix the configuration file and restart DSH.',
+      notWritable: 'The Host configuration document does not accept writes right now, so nothing can be saved. Check that DSH may write it, or edit the configuration file by hand.',
+      loadingRow: 'Reading the configuration… If this never finishes, reload the page.',
+      badValue: 'The configuration did not pass the Host\u2019s validation, so it cannot be edited here. Check the DSH log for the error, or edit the configuration file directly.',
+      hostMismatch: 'You reached this page at {here}, but the plugin publishes {published}. Those two differ: the authority a browser actually uses must be in dsh web --trusted-host as well, or the published address answers 403 to everything.',
       needOrigin: 'No public origin yet. Fill in “Public origin” below and save; the public entry point opens then (the local GUI on 127.0.0.1 is unaffected).',
       gateway: 'Gateway',
       tunnel: 'Tunnel',
@@ -332,6 +419,22 @@ window.__ModuleLoader__.load({
       tunnelFailedHint: 'That is ssh2\u2019s own reason (ECONNREFUSED usually means the host or port is wrong). Fix it and save to retry.',
       tunnelBlocked: 'The tunnel is closed: the DSH trust fence refuses this Host.',
       tunnelBlockedHint: 'Restart DSH as dsh --profile web --public-url <public origin>/ --trusted-host <host>. Until it accepts this Host, the public entry point stays closed \u2014 deliberately, not by accident.',
+      retry: 'Retry now',
+      retrying: 'Retrying\u2026',
+      retryStarted: 'A new connection attempt was started; the state refreshes on its own.',
+      retryFailed: 'The retry did not succeed:',
+      nextRetry: 'next retry',
+      suspectedConfig: 'Repeated failures and not one success yet: check "VPS address" and "VPS SSH port" first. The backoff has slowed to five minutes \u2014 save a fix or press Retry now.',
+      hintKey: 'The private key cannot be read or is in a format ssh2 rejects: fix "absolute path to the private key", or generate a new one (OpenSSH, PKCS#1, SEC1, or PuTTY PPK only).',
+      hintAuth: 'SSH authentication was rejected: check the SSH user, that the key belongs to that user, and the key\u2019s passphrase.',
+      hintHostKey: 'The server\u2019s host key does not match the pinned one: once you are sure this is your VPS after a reinstall, press Trust again below.',
+      hintForward: 'The VPS refused to listen on the tunnel port: usually a previous session that never released it. Follow the command, end the process holding it, then press Retry now.',
+      hintConfig: 'Cannot reach the VPS: check the VPS address and SSH port, that the VPS is running, and that its firewall allows the port.',
+      hintDropped: 'The tunnel dropped (a VPS reboot or a network interruption): it reconnects by itself, and the public address answers 502 meanwhile.',
+      release: 'Release the VPS port',
+      releasing: 'Releasing\u2026',
+      releaseDone: 'Released: ',
+      releaseFailed: 'Could not release it: ',
       groupBasic: 'Basics',
       groupTunnel: 'SSH reverse tunnel',
       infoTitle: 'Fixed values (not editable)',
@@ -415,6 +518,7 @@ window.__ModuleLoader__.load({
           { path: 'tunnel.user', kind: 'text', required: true, zh: 'SSH 用户', en: 'SSH user', placeholder: 'root' },
           { path: 'tunnel.privateKeyFile', kind: 'text', required: true, zh: '私钥绝对路径', en: 'Private key (absolute path)', placeholder: 'C:\\Users\\me\\.ssh\\id_ed25519' },
           { path: 'tunnel.passphrase', kind: 'secret', zh: '私钥口令', en: 'Key passphrase' },
+          { path: 'tunnel.releaseStaleForward', kind: 'tristate', zh: '释放 VPS 端口', en: 'Release the VPS port', hint: '开启后：连续三次「VPS 拒绝监听」时，插件会用同一个 SSH 用户在 VPS 上执行 `ss -ltnp` 并在确认占用者是 sshd 后 `kill <pid>`。这是本插件唯一会在 VPS 上动手的能力，默认关闭。' },
         ],
       },
     ]
@@ -655,7 +759,48 @@ window.__ModuleLoader__.load({
           return own !== undefined && own !== null
         }
 
-        const writable = snapshot.writable && snapshot.mode === 'host' && snapshot.status !== 'unavailable'
+        /**
+         * Whether this page may write the row's configuration.
+         *
+         * Three facts that actually exist: the Host document accepts writes, the
+         * namespace's value was accepted by this client, and this page runs on the
+         * operator's own machine. An earlier version tested
+         * `snapshot.mode === 'host'` — DSH's form snapshot carries no such field,
+         * so that condition was false everywhere and disabled every input on every
+         * page, the loopback one included.
+         */
+        const writable = snapshot.writable && snapshot.status === 'ready' && isLoopbackPage()
+
+        /** @returns the one reason this form is not editable, or null when it is. */
+        const lockedReason = function (): string | null {
+          if (writable) return null
+          if (snapshot.status === 'unavailable') return t('unavailable')
+          if (!snapshot.writable) return t('notWritable')
+          if (!isLoopbackPage()) return t('readOnly')
+          return snapshot.revision === undefined ? t('loadingRow') : t('badValue')
+        }
+
+        /**
+         * The one piece of advice that fits the failure the Host classified.
+         *
+         * The kinds exist so this page can name the field to fix; ssh2's own wording
+         * stays above it as the evidence, never as the instruction.
+         * @param tunnel - the tunnel's live snapshot.
+         * @returns the localized hint.
+         */
+        const hintFor = function (tunnel: NonNullable<Status['runtime']['tunnel']>): string {
+          switch (tunnel.kind) {
+            case 'key': return t('hintKey')
+            case 'auth': return t('hintAuth')
+            case 'host-key': return t('hintHostKey')
+            case 'forward-refused': return t('hintForward')
+            case 'dns':
+            case 'unreachable':
+            case 'handshake-timeout': return t('hintConfig')
+            case 'dropped': return t('hintDropped')
+            default: return t('tunnelFailedHint')
+          }
+        }
 
         /** @returns validation problems keyed by field path. */
         const problems = function (): Record<string, string> {
@@ -770,6 +915,49 @@ window.__ModuleLoader__.load({
             .then(() => { setBusy(false) })
         }
 
+        /**
+         * Re-dial the tunnel now instead of waiting out the backoff.
+         *
+         * The Host runs the same fence-checked starter the boot path uses, so this
+         * can only re-dial what the deployment is allowed to serve — and its refusal
+         * (the fence still says no) is shown as the reason rather than as a failure.
+         */
+        const retryTunnel = function (): void {
+          setBusy(true)
+          setMessage(t('retrying'))
+          fetch(RETRY_PATH, { method: 'POST' })
+            .then(async (response) => {
+              const payload = (await response.json().catch(() => null)) as { error?: unknown } | null
+              if (!response.ok) throw new Error(payload && payload.error ? String(payload.error) : 'HTTP ' + String(response.status))
+              setMessage(t('retryStarted'))
+              return refresh()
+            })
+            .catch((error: unknown) => { setMessage(t('retryFailed') + ' ' + (error instanceof Error ? error.message : String(error))) })
+            .then(() => { setBusy(false) })
+        }
+
+        /**
+         * End the sshd that still holds the tunnel port on the VPS.
+         *
+         * Only offered when the row switched it on, and only from the banner that
+         * explains the refusal: the Host re-checks the switch and refuses to act on
+         * any holder it cannot prove is an sshd, so this control cannot widen what
+         * the plugin is allowed to do.
+         */
+        const releasePort = function (): void {
+          setBusy(true)
+          setMessage(t('releasing'))
+          fetch(RELEASE_PATH, { method: 'POST' })
+            .then(async (response) => {
+              const payload = (await response.json().catch(() => null)) as { error?: unknown, detail?: unknown } | null
+              if (!response.ok) throw new Error(payload && payload.error ? String(payload.error) : 'HTTP ' + String(response.status))
+              setMessage(t('releaseDone') + (payload && payload.detail ? String(payload.detail) : ''))
+              return refresh()
+            })
+            .catch((error: unknown) => { setMessage(t('releaseFailed') + ' ' + (error instanceof Error ? error.message : String(error))) })
+            .then(() => { setBusy(false) })
+        }
+
         /** @param url - the enrollment link to copy. */
         const copyLink = function (url: string): void {
           const clipboard = navigator.clipboard
@@ -878,11 +1066,20 @@ window.__ModuleLoader__.load({
           h('span', null, t('gateway') + ': ' + (status !== null && status.runtime.gateway === 'listening' ? t('listening') : t('off'))),
         ]))
         if (status !== null && status.runtime.tunnel !== null) {
+          const tunnel = status.runtime.tunnel
+          // The kind is the actionable half of a failure ("auth" says which field to
+          // look at), so it rides beside the state, and the countdown answers the
+          // one question a retrying tunnel raises: how long until it tries again.
+          const countdown = tunnel.nextRetryAt === null
+            ? ''
+            : ' · ' + t('nextRetry') + ' ' + String(Math.max(0, Math.round((tunnel.nextRetryAt - Date.now()) / 1000))) + 's'
           facts.push(h('div', { className: 'sr-fact', key: 'tn' }, [
-            h('span', { className: 'sr-dot' + (status.runtime.tunnel.state === 'listening' ? ' ok' : ' bad') }),
-            h('span', null, t('tunnel') + ': ' + status.runtime.tunnel.state
-              + (status.runtime.tunnel.remote === null ? '' : ' → ' + status.runtime.tunnel.remote)
-              + ' · ' + String(status.runtime.tunnel.attempts) + '×'),
+            h('span', { className: 'sr-dot' + (tunnel.state === 'listening' ? ' ok' : ' bad') }),
+            h('span', null, t('tunnel') + ': ' + tunnel.state
+              + (tunnel.kind === null ? '' : ' (' + tunnel.kind + ')')
+              + (tunnel.remote === null ? '' : ' → ' + tunnel.remote)
+              + ' · ' + String(tunnel.attempts) + '×'
+              + countdown),
           ]))
         }
         if (status !== null && status.runtime.fence !== null) {
@@ -900,6 +1097,24 @@ window.__ModuleLoader__.load({
           // Nothing is wrong yet — the operator simply has not named an origin.
           banners.push(h('div', { className: 'sr-banner warn', key: 'origin' }, t('needOrigin')))
         }
+        // The one mismatch no server-side check can see. The tunnel's gate asks the
+        // fence about the authority this plugin *publishes*; a page can only be read
+        // at the authority the browser *typed*. Reaching this page at all means the
+        // fence accepted that one, so a difference between the two means they are
+        // published and trusted out of step — and a visitor using the published
+        // address would be refused.
+        //
+        // Only for a page that is NOT the operator's own machine: reaching this page
+        // on 127.0.0.1 while publishing a public domain is the normal way to edit it,
+        // not a misconfiguration.
+        const publishedHost = status !== null && typeof status.effective.publicOrigin === 'string'
+          ? hostOf(status.effective.publicOrigin)
+          : null
+        const pageHost = (window as { location?: { host?: string } }).location?.host ?? null
+        if (!isLoopbackPage() && publishedHost !== null && pageHost !== null && pageHost !== publishedHost) {
+          banners.push(h('div', { className: 'sr-banner warn', key: 'host' },
+            t('hostMismatch').replace('{here}', pageHost).replace('{published}', publishedHost)))
+        }
         // A tunnel that keeps retrying is the one failure the page used to hide:
         // the state line said "reconnecting", and the reason only reached the
         // console the operator is not looking at.
@@ -916,17 +1131,32 @@ window.__ModuleLoader__.load({
           ]))
         } else if (status !== null && status.runtime.tunnel !== null && status.runtime.tunnel.state !== 'listening'
           && status.runtime.tunnel.lastError !== null) {
+          const tunnel = status.runtime.tunnel
           banners.push(h('div', { className: 'sr-banner error', key: 'tunnel' }, [
             h('div', null, t('tunnelFailed')),
-            h('code', null, status.runtime.tunnel.lastError),
-            h('div', { className: 'sr-hint' }, t('tunnelFailedHint')),
+            h('code', null, tunnel.lastError),
+            // The advice follows the classified kind, so the page names the field to
+            // fix instead of handing over ssh2's wording and letting the operator
+            // guess which of six values is wrong.
+            h('div', { className: 'sr-hint' }, hintFor(tunnel)),
+            tunnel.suspected === 'configuration' ? h('div', { className: 'sr-hint' }, t('suspectedConfig')) : null,
+            h('div', { className: 'sr-actions' }, [
+              h('button', { className: 'sr-btn', type: 'button', disabled: busy, onClick: retryTunnel }, busy ? t('retrying') : t('retry')),
+              // The release control exists only where it is the right answer (a
+              // refused remote forward) and only when the row switched it on: the
+              // Host refuses either way, and offering a capability the deployment
+              // does not have would be a lie the click would expose.
+              tunnel.kind === 'forward-refused' && status.effective['tunnel.releaseStaleForward'] === true
+                ? h('button', { className: 'sr-btn', type: 'button', disabled: busy, onClick: releasePort }, busy ? t('releasing') : t('release'))
+                : null,
+            ]),
           ]))
         }
-        if (snapshot.status === 'unavailable') {
-          banners.push(h('div', { className: 'sr-banner warn', key: 'ns' }, t('unavailable')))
-        }
-        if (!writable) {
-          banners.push(h('div', { className: 'sr-banner warn', key: 'ro' }, t('readOnly')))
+        // One banner for one reason. Every branch names something the operator can
+        // act on, so "the boxes are greyed out" never has to be guessed at.
+        const locked = lockedReason()
+        if (locked !== null) {
+          banners.push(h('div', { className: 'sr-banner warn', key: 'ro' }, locked))
         }
         if (loadError !== null) {
           banners.push(h('div', { className: 'sr-banner warn', key: 'le' }, '/api/sync-remote.state → ' + loadError))

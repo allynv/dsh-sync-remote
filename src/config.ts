@@ -52,6 +52,15 @@ const DEFAULT_KEEPALIVE_INTERVAL_MS = 30_000
 const DEFAULT_KEEPALIVE_COUNT_MAX = 3
 const DEFAULT_READY_TIMEOUT_MS = 20_000
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 60_000
+/**
+ * Retry ceiling once repeated failures have never once succeeded.
+ *
+ * Deliberately larger than {@link DEFAULT_RECONNECT_MAX_DELAY_MS}: the operator's
+ * cap describes a transient retry, while a typo in `tunnel.host` or
+ * `tunnel.port` must not dial the VPS every minute for as long as DSH runs. It is
+ * a resolved value rather than a module constant so the behavior stays testable.
+ */
+const DEFAULT_SUSPECTED_RECONNECT_MAX_DELAY_MS = 300_000
 const MAX_CHANNELS = 64
 
 /**
@@ -106,6 +115,9 @@ export const Config = z.object({
     passphrase: z.string().role('secret')
       .description('Passphrase for the private key, when it has one. Never sent back to the browser.')
       .volatile(),
+    releaseStaleForward: z.boolean()
+      .description('Allow this plugin to end an sshd on the VPS that still holds the tunnel port (it runs `ss -ltnp` and `kill <pid>` as the SSH user). Off unless set: it is the only action this plugin may take on the VPS.')
+      .volatile(),
   }).description('SSH reverse tunnel from the VPS to this gateway.'),
 })
 
@@ -140,6 +152,14 @@ export interface ResolvedTunnelConfig {
   readonly keepaliveCountMax: number
   readonly readyTimeoutMs: number
   readonly reconnectMaxDelayMs: number
+  /** Retry ceiling for a deployment that has never once come up (see the constant's doc). */
+  readonly suspectedReconnectMaxDelayMs: number
+  /**
+   * Whether this row lets the plugin end an sshd on the VPS that still holds the
+   * tunnel port. Off unless the operator turned it on: it is the only action this
+   * plugin may take on a machine that is not this one.
+   */
+  readonly releaseStaleForward: boolean
   readonly maxChannels: number
 }
 
@@ -310,18 +330,31 @@ function count(
  * @returns the resolved boolean, or undefined when the row names none.
  */
 function flag(row: RowConfig, sources?: Provenance): boolean | undefined {
-  const own = lookup(row, 'tunnel.enabled')
+  return booleanField(row, 'tunnel.enabled', sources)
+}
+
+/**
+ * Read one boolean row field. Only the literal `true`/`false` and the usual
+ * `1/0`, `yes/no`, `on/off` spellings are accepted; anything else is a typo the
+ * operator must see rather than a silently enabled capability.
+ * @param row - plain row config.
+ * @param path - dotted field path.
+ * @param sources - optional accumulator recording which layer answered.
+ * @returns the resolved boolean, or undefined when the row names none.
+ */
+function booleanField(row: RowConfig, path: string, sources?: Provenance): boolean | undefined {
+  const own = lookup(row, path)
   if (own === undefined || own === null || own === '') {
-    note(sources, 'tunnel.enabled', 'unset')
+    note(sources, path, 'unset')
     return undefined
   }
-  note(sources, 'tunnel.enabled', 'patch')
+  note(sources, path, 'patch')
   if (typeof own === 'boolean') return own
   const normalized = String(own).trim().toLowerCase()
   if (['true', '1', 'yes', 'on'].includes(normalized)) return true
   if (['false', '0', 'no', 'off'].includes(normalized)) return false
   throw new ConfigError(
-    `dsh-sync-remote: tunnel.enabled must be a boolean, got ${JSON.stringify(own)}`,
+    `dsh-sync-remote: ${path} must be a boolean, got ${JSON.stringify(own)}`,
   )
 }
 
@@ -436,6 +469,8 @@ export function resolveConfig(raw: RowConfig = {}, sources?: Provenance): Resolv
       keepaliveCountMax: DEFAULT_KEEPALIVE_COUNT_MAX,
       readyTimeoutMs: DEFAULT_READY_TIMEOUT_MS,
       reconnectMaxDelayMs: DEFAULT_RECONNECT_MAX_DELAY_MS,
+      suspectedReconnectMaxDelayMs: DEFAULT_SUSPECTED_RECONNECT_MAX_DELAY_MS,
+      releaseStaleForward: booleanField(row, 'tunnel.releaseStaleForward', sources) ?? false,
       maxChannels: MAX_CHANNELS,
     },
   }

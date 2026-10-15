@@ -69,7 +69,16 @@ interface GatewayStatus {
   rpID: string
   enrolled: boolean
   passkeyCount: number
-  tunnel: { state: string; attempts: number; channels: number; lastError: string | null } | null
+  tunnel: {
+    state: string
+    kind: string | null
+    attempts: number
+    channels: number
+    everListening: boolean
+    nextRetryAt: number | null
+    suspected: string | null
+    lastError: string | null
+  } | null
   bind: string
   web: string
   secureCookies: boolean
@@ -335,6 +344,23 @@ await check('the passkey gateway reports the deployment it serves', () => {
     throw new Error(`the tunnel is ${tunnel.state} (${why}); a configured tunnel must be listening`)
   }
   const tunnelNote = tunnel === null ? 'off' : `${tunnel.state} attempts=${String(tunnel.attempts)} channels=${String(tunnel.channels)}`
+  // The classification is what the settings page turns into an instruction, so a
+  // report that could not carry it (`kind`, plus the two facts behind the
+  // escalation) would leave the page guessing — the failure this version fixed.
+  if (tunnel !== null) {
+    if (tunnel.kind !== null && typeof tunnel.kind !== 'string') {
+      throw new Error(`the tunnel reports kind ${JSON.stringify(tunnel.kind)}, which is neither a classification name nor null`)
+    }
+    if (typeof tunnel.everListening !== 'boolean') {
+      throw new Error(`the tunnel reports everListening=${JSON.stringify(tunnel.everListening)}; the page needs that fact to tell a typo from a reboot`)
+    }
+    if (tunnel.nextRetryAt !== null && !Number.isSafeInteger(tunnel.nextRetryAt)) {
+      throw new Error(`the tunnel reports nextRetryAt=${JSON.stringify(tunnel.nextRetryAt)}, which is neither a timestamp nor null`)
+    }
+    if (tunnel.state === 'listening' && tunnel.kind !== null) {
+      throw new Error(`the tunnel is listening while it still reports failure kind ${tunnel.kind}`)
+    }
+  }
   return `origin ${publicOrigin} · rpID ${report.rpID} · bind ${report.bind} · web ${report.web} · enrolled=${String(report.enrolled)} `
     + `passkeys=${String(report.passkeyCount)} · tunnel=${tunnelNote} · secureCookies=${String(report.secureCookies)} · enrollmentPending=${String(report.enrollmentPending)}`
 })
